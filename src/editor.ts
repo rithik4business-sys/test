@@ -2,7 +2,8 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as readline from 'readline';
-import { spawn } from 'child_process';
+import { spawn, spawnSync } from 'child_process';
+import { shellFor, shellQuote, runnerFor, taskkillArgs } from './winsh';
 import { highlightLine, stripAnsi, HighlightPalette } from './highlight';
 import { getLanguageFromExt, getFileExtension, readFileSync, writeFileSync, fileExists, loadConfig, saveConfig, isBinaryFile, loadSession, saveSession, scheduleSessionSave, flushSession } from './utils';
 import { THEME_NAMES, getTheme, DEFAULT_THEME, isThemeName } from './themes';
@@ -527,13 +528,8 @@ function paint(): void {
 }
 
 /* ---------- shell (integrated terminal panel) ---------- */
-
-function shellFor(): { cmd: string; args: (c: string) => string[] } {
-  if (process.platform === 'win32') {
-    return { cmd: 'powershell.exe', args: (c) => ['-NoProfile', '-NonInteractive', '-Command', c] };
-  }
-  return { cmd: 'sh', args: (c) => ['-c', c] };
-}
+/* Spawn target comes from winsh: powershell.exe with Bypass policy +
+ * UTF-8 output on win32, sh -c elsewhere. */
 
 function termPrint(s: string): void {
   termLines.push(s); // ring overwrites oldest past capacity — O(1), no copy
@@ -1129,15 +1125,7 @@ function restoreUndo(): void {
   undoStack = restoreUndoFor(buf.filePath);
 }
 
-/* ---------- code runner ---------- */
-const RUNNERS: Record<string, string> = {
-  js: 'node', mjs: 'node', cjs: 'node',
-  py: 'python3', sh: 'bash', bash: 'bash',
-  ps1: 'pwsh', go: 'go run', rb: 'ruby', php: 'php',
-};
-function shQuote(s: string): string {
-  return '"' + s.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\$/g, '\\$').replace(/`/g, '\\`') + '"';
-}
+/* ---------- code runner (prefixes from winsh.ts, platform-aware) ---------- */
 
 const MAX_MATCHES = 5000;
 function doSearch(q: string): void {
@@ -1306,10 +1294,10 @@ function runCmd(raw: string): void {
       if (!buf.filePath) { say('Open a file first', true); break; }
       if (buf.modified && !saveFile()) break;
       const ext = getFileExtension(buf.filePath);
-      const runner = RUNNERS[ext];
+      const runner = runnerFor(ext);
       if (!runner) { say(`No runner for .${ext || '?'}`, true); break; }
       const dir = path.dirname(buf.filePath);
-      runShell(`${runner} ${shQuote(path.basename(buf.filePath))}`, dir === '' ? process.cwd() : dir);
+      runShell(`${runner} ${shellQuote(path.basename(buf.filePath))}`, dir === '' ? process.cwd() : dir);
       break;
     }
     case 'term': {
@@ -1447,11 +1435,22 @@ function editNormal(key: string): void {
   }
 }
 
+function killTree(p: any): void {
+  if (!p) return;
+  try {
+    if (process.platform === 'win32') {
+      spawnSync('taskkill', taskkillArgs(p.pid), { windowsHide: true, timeout: 5000 });
+      return;
+    }
+    p.kill('SIGTERM');
+  } catch { /* noop */ }
+}
+
 function onKey(key: string): void {
   if (key === '\x03') { // Ctrl+C — kills running term cmd first, never strands output
     if (focus === 'term' && termChild) {
-      try { termChild.kill('SIGTERM'); } catch { /* noop */ }
-      setTimeout(() => { try { if (termChild) termChild.kill('SIGKILL'); } catch { /* noop */ } }, 2000);
+      killTree(termChild);
+      setTimeout(() => { try { const c = termChild; if (c && process.platform !== 'win32') c.kill('SIGKILL'); } catch { /* noop */ } }, 2000);
       termPrint(fg(T.yellow) + '^C' + RESET);
       paint();
       return;
@@ -1756,7 +1755,12 @@ function cleanup(): void {
     });
   } catch { /* noop */ }
   try { flushSession(); } catch { /* noop */ }
-  try { if (termChild) termChild.kill('SIGKILL'); } catch { /* noop */ }
+  try {
+    if (termChild) {
+      if (process.platform === 'win32') killTree(termChild);
+      else termChild.kill('SIGKILL');
+    }
+  } catch { /* noop */ }
   termChild = null;
   if (msgTimer) { clearTimeout(msgTimer); msgTimer = null; }
   if (leaderTimer) { clearTimeout(leaderTimer); leaderTimer = null; }

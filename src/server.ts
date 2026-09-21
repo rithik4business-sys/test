@@ -8,6 +8,7 @@ import { safePath, getVersion, isHiddenRel, loadToken, saveToken, clearToken, lo
 import * as gh from './github';
 import { collectProjectFiles } from './collect';
 import { CappedBuffer } from './structures';
+import { psCommandArgs } from './winsh';
 export { collectProjectFiles };
 
 const ROOT = path.resolve(process.cwd());
@@ -912,7 +913,7 @@ export function startServer(port = 3000, host = '127.0.0.1'): Promise<void> {
           }
           const shell = process.platform === 'win32' ? 'powershell.exe' : 'sh';
           const args = process.platform === 'win32'
-            ? ['-NoProfile', '-NonInteractive', '-Command', cmd]
+            ? psCommandArgs(cmd)
             : ['-c', cmd];
           const shellName = process.platform === 'win32' ? 'powershell' : 'sh';
           try {
