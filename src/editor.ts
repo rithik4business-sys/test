@@ -720,8 +720,20 @@ function newline(): void {
 function backspace(): void {
   if (buf.cx > 0) {
     snapshot();
-    buf.lines[buf.cy] = curLine().slice(0, buf.cx - 1) + curLine().slice(buf.cx);
-    buf.cx--;
+    // Delete by code POINT, not code unit: a surrogate pair (emoji, CJK ext)
+    // split by unit-wise slicing leaves a lone half, which encodes to U+FFFD
+    // and corrupts the buffer/file.
+    const l = curLine();
+    let start = buf.cx - 1;
+    const c = l.charCodeAt(start);
+    if (c >= 0xdc00 && c <= 0xdfff && start > 0) {
+      start--; // caret after a pair — remove both units
+    } else if (c >= 0xd800 && c <= 0xdbff && buf.cx < l.length) {
+      const c2 = l.charCodeAt(buf.cx);
+      if (c2 >= 0xdc00 && c2 <= 0xdfff) buf.cx++; // caret inside a pair — remove it whole
+    }
+    buf.lines[buf.cy] = l.slice(0, start) + l.slice(buf.cx);
+    buf.cx = start;
     buf.modified = true;
   } else if (buf.cy > 0) {
     snapshot();
@@ -1034,6 +1046,11 @@ function playReg(name: string, n: number): void {
   } finally { playing = false; }
 }
 const VIM_MOTIONS = ['h', 'j', 'k', 'l', 'w', 'b', 'e', '0', '$'];
+/** Normal-mode keys recorded into macros under their replay-safe equivalent.
+ * Registers are a flat string replayed code-point by code-point (playReg), so
+ * a named key like 'DOWN' would replay as literal D,O,W,N — D = delete-to-EOL,
+ * O = open line — corrupting the buffer on @-replay. */
+const REC_KEY: Record<string, string> = { UP: 'k', DOWN: 'j', LEFT: 'h', RIGHT: 'l', DEL: 'x' };
 function vimKey(key: string): boolean {
   if (recWait) {
     recWait = false;
@@ -1130,11 +1147,30 @@ function vimKey(key: string): boolean {
     return true;
   }
   if (key === '@') { atWait = true; return true; }
-  recordKey(key);
+  recordKey(REC_KEY[key] ?? (key.length === 1 ? key : ''));
   if (/^[1-9]$/.test(key) || (key === '0' && vCount > 0)) { vCount = vCount * 10 + parseInt(key, 10); return true; }
   if (key === 'g') {
-    if (vG) { vG = false; vCount = 0; if (!visual && buf.cy !== 0) pushJump(); gotoOff(0); }
-    else vG = true;
+    if (vG) {
+      vG = false;
+      vCount = 0;
+      const op = vOp; vOp = null;
+      if (op) {
+        // dgg/ygg/cgg: this handler runs BEFORE the operator block below, so
+        // it used to execute the BOF jump while the operator stayed armed —
+        // the next unrelated key then triggered the delete from line 0
+        // (d,g,g,l deleted the file's first character).
+        const from = offOf(buf.cy, buf.cx);
+        setDot([op.op, 'g', 'g']);
+        if (op.op === 'y') yankRange(0, from);
+        else {
+          delRange(from, 0);
+          if (op.op === 'c') { vim = 'insert'; insBegin([op.op, 'g', 'g']); }
+        }
+      } else {
+        if (!visual && buf.cy !== 0) pushJump();
+        gotoOff(0);
+      }
+    } else vG = true;
     return true;
   }
   vG = false;
@@ -1167,9 +1203,14 @@ function vimKey(key: string): boolean {
       return true;
     }
     if (key === 'i' || key === 'a') { vObj = { op: op.op, n: op.n, around: key === 'a' }; return true; }
-    if (VIM_MOTIONS.includes(key)) {
+    // 'G' is not in VIM_MOTIONS, yet the branch below special-cases it — the
+    // includes() gate made dG/yG/cG fall through to the bare `return true`
+    // and silently discard the pending operator (and the motion).
+    if (VIM_MOTIONS.includes(key) || key === 'G') {
       const from = offOf(buf.cy, buf.cx);
-      const to = key === 'G' ? offOf(buf.lines.length - 1, 0)
+      // Run through EOF: the old target was the last line's column 0, which
+      // left the final line undeleted and yanked the wrong span for yG.
+      const to = key === 'G' ? bufText().length
         : key === '$' ? lineEndExcl(from)
         : motionTarget(key, from, op.n * n);
       const mult = op.n * n;
@@ -1203,8 +1244,19 @@ function vimKey(key: string): boolean {
     if (buf.cx < curLine().length) {
       setDot(n > 1 ? [String(n), 'x'] : ['x']);
       snapshot();
-      buf.lines[buf.cy] = curLine().slice(0, buf.cx) + curLine().slice(buf.cx + n);
-      buf.cx = clamp(buf.cx, 0, curLine().length);
+      // Delete n code POINTS: unit-wise slicing split surrogate pairs and
+      // left a lone half (U+FFFD on save) — e.g. 'x' on an emoji at the caret.
+      const l = curLine();
+      let s0 = buf.cx;
+      const cs = l.charCodeAt(s0);
+      if (cs >= 0xdc00 && cs <= 0xdfff && s0 > 0) s0--;
+      let e = s0;
+      for (let k = 0; k < n && e < l.length; k++) {
+        e++;
+        while (e < l.length && l.charCodeAt(e) >= 0xdc00 && l.charCodeAt(e) <= 0xdfff) e++;
+      }
+      buf.lines[buf.cy] = l.slice(0, s0) + l.slice(e);
+      buf.cx = clamp(s0, 0, buf.lines[buf.cy].length);
       buf.modified = true;
     }
     return true;
@@ -1684,14 +1736,25 @@ function editNormal(key: string): void {
       buf.lines[buf.cy] = curLine().slice(0, buf.cx);
       buf.modified = true;
       break;
-    case 'DEL': // Delete key
+    case 'DEL': { // Delete key
       if (buf.cx < curLine().length) {
         setDot(['DEL']);
         snapshot();
-        buf.lines[buf.cy] = curLine().slice(0, buf.cx) + curLine().slice(buf.cx + 1);
+        // Remove a whole surrogate pair when one straddles the cursor —
+        // deleting a single unit orphans the other (renders as U+FFFD).
+        const l = curLine();
+        let s0 = buf.cx;
+        const cs = l.charCodeAt(s0);
+        if (cs >= 0xdc00 && cs <= 0xdfff && s0 > 0) s0--;
+        const c = l.charCodeAt(s0);
+        const pair = c >= 0xd800 && c <= 0xdbff && s0 + 1 < l.length &&
+          l.charCodeAt(s0 + 1) >= 0xdc00 && l.charCodeAt(s0 + 1) <= 0xdfff;
+        buf.lines[buf.cy] = l.slice(0, s0) + l.slice(s0 + (pair ? 2 : 1));
+        buf.cx = clamp(s0, 0, buf.lines[buf.cy].length);
         buf.modified = true;
       }
       break;
+    }
     case 'u': undo(); break;
     case 'r': redo(); break;
     case '\x13': saveFile(); break; // Ctrl+S
@@ -1708,7 +1771,7 @@ function editNormal(key: string): void {
     case 'LEFT': buf.cx = Math.max(0, buf.cx - 1); break;
     case 'RIGHT': buf.cx = Math.min(curLine().length, buf.cx + 1); break;
     case 'HOME': buf.cy = 0; buf.cx = 0; break;
-    case 'END': buf.cy = buf.lines.length - 1; buf.cx = 0; break;
+    case 'END': buf.cy = buf.lines.length - 1; buf.cx = curLine().length; break;
     case 'PGUP': buf.cy = Math.max(0, buf.cy - visibleMainHeight()); clampCur(); break;
     case 'PGDN': buf.cy = Math.min(buf.lines.length - 1, buf.cy + visibleMainHeight()); clampCur(); break;
   }
@@ -1873,7 +1936,7 @@ function onKey(key: string): void {
   // focus === 'edit'
   if (vim === 'insert') {
     cmpState = (key === '\x0e' || key === '\x10') ? cmpState : null;
-    if (key === '\x1b') { vim = 'normal'; clampCur(); insEnd(); }
+    if (key === '\x1b') { recordKey('\x1b'); vim = 'normal'; clampCur(); insEnd(); }
     else if (key === '\x0e' || key === '\x10') completeWord(key === '\x0e' ? 1 : -1);
     else if (key === '\r') { recordKey('\n'); insPush('\r'); newline(); }
     else if (key === '\x7f' || key === '\x08') { recordKey('\b'); insPush('\x7f'); backspace(); }
@@ -1892,7 +1955,7 @@ function onKey(key: string): void {
 }
 
 /* Parse raw stdin chunks into keys */
-const CSI_RE = /^\x1b\[([0-9;]*)([A-Za-z~])/;
+const CSI_RE = /^\x1b\[([0-9;?<>=!]*)([A-Za-z~])/;
 let feedPartial = '';
 let mouseOn = false;
 try { mouseOn = loadConfig().mouse === true; } catch { /* keep off */ }
@@ -1921,7 +1984,10 @@ function handleMouse(cb: number, col1: number, row1: number): void {
       } else {
         for (const rg of layoutRegions(h, termH)) {
           if (cy >= rg.y0 && cy < rg.y1) {
-            const B = buffers[rg.bi]?.b;
+            // buffers[i].b is only a stash — the ACTIVE pane must scroll the
+            // live buf (same rule paint() uses), otherwise wheel-scrolling the
+            // active pane mutates a stale snapshot that paint never reads.
+            const B = rg.active ? buf : buffers[rg.bi]?.b;
             if (B) B.sy = Math.max(0, B.sy + d);
             break;
           }
@@ -1947,23 +2013,24 @@ function handleMouse(cb: number, col1: number, row1: number): void {
   }
   for (const rg of layoutRegions(h, termH)) {
     if (cy < rg.y0 || cy >= rg.y1) continue;
-    const B = buffers[rg.bi]?.b;
-    if (!B) continue;
-    const digits = String(B.lines.length).length;
-    const codeX = tw + 1 + (splitOn ? 1 : 0) + digits + 1;
     stashBuf();
     if (rg.bi !== curIdx()) {
       if (buf.modified) { say('Unsaved changes — :w first', true); loadBuf(curIdx()); return; }
       panes[activePane] = rg.bi;
       loadBuf(rg.bi);
     }
+    if (!buffers[rg.bi]) continue;
     focus = 'edit';
-    const lineIdx = clamp(B.sy + (cy - rg.y0), 0, B.lines.length - 1);
-    B.cy = lineIdx;
+    // Resolve line/col from the LIVE buffer: buffers[rg.bi].b captured before
+    // the stash/load above is a stale snapshot (sy/sx/lines from the last
+    // stashBuf), so clicks landed on the wrong line after any keyboard
+    // scrolling or edits since that stash.
+    const digits = String(buf.lines.length).length;
+    const codeX = tw + 1 + (splitOn ? 1 : 0) + digits + 1;
+    const lineIdx = clamp(buf.sy + (cy - rg.y0), 0, buf.lines.length - 1);
     buf.cy = lineIdx;
-    const line = B.lines[lineIdx] ?? '';
-    buf.cx = cx <= codeX ? 0 : clamp(cx - codeX + B.sx, 0, line.length);
-    B.cx = buf.cx;
+    const line = curLine();
+    buf.cx = cx <= codeX ? 0 : clamp(cx - codeX + buf.sx, 0, line.length);
     clampCur();
     paint();
     return;
@@ -1992,7 +2059,18 @@ function feed(data: Buffer): void {
       i += 6;
     } else if (s[i] === '\x1b' && s[i + 1] === '[') {
       const m = s.slice(i).match(CSI_RE);
-      if (!m) { feedPartial = s.slice(i); break; }
+      if (!m) {
+        // Only hold a partial CSI while it could still become one (params are
+        // 0x20-0x3F, and the prefix stays short). Holding anything else made
+        // feedPartial swallow every future keystroke forever — and grow
+        // without bound — e.g. after '\x1b[[' or an unknown sequence.
+        const rest = s.slice(i + 2);
+        if (rest.length <= 16 && /^[\x20-\x3f]*$/.test(rest)) { feedPartial = s.slice(i); break; }
+        flushInsert();
+        onKey('\x1b');
+        i += 1;
+        continue;
+      }
       flushInsert();
       const code = m[2];
       const nums = m[1];
@@ -2012,8 +2090,13 @@ function feed(data: Buffer): void {
       onKey(c === 'H' ? 'HOME' : c === 'F' ? 'END' : '\x1b');
       i += 3;
     } else if (s[i] === '\x1b' && i + 1 >= s.length) {
-      feedPartial = s.slice(i);
-      break;
+      // Lone ESC at the end of this chunk: deliver it NOW. Holding it until
+      // the next read meant a bare Esc keystroke never took effect — the
+      // pending ESC was only flushed right before the *following* key, so
+      // INSERT/VISUAL never left on Esc alone.
+      flushInsert();
+      onKey('\x1b');
+      i++;
     } else {
       const ch = s[i];
       if (vim === 'insert' && focus === 'edit' && ch.length === 1 && ch >= ' ' && ch !== '\x7f') {
@@ -2107,7 +2190,14 @@ async function confirmQuit(): Promise<void> {
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
     let ans = '';
     try {
-      ans = (await new Promise<string>((res) => rl.question(`Unsaved changes in: ${dirty.join(', ')} — quit anyway? (y/N) `, res))).trim().toLowerCase();
+      ans = (await new Promise<string>((res) => {
+        rl.question(`Unsaved changes in: ${dirty.join(', ')} — quit anyway? (y/N) `, res);
+        // stdin EOF closes the interface without ever invoking the question
+        // callback (Node readline docs: 'close' fires on end-of-input) —
+        // without this the promise never settles, confirmingQuit stays true,
+        // and the editor hangs. Same bug class as the fixed one in index.ts.
+        rl.once('close', () => res(''));
+      })).trim().toLowerCase();
     } catch { ans = ''; }
     try { rl.close(); } catch { /* noop */ }
     if (ans === 'y' || ans === 'yes') {
@@ -2190,6 +2280,12 @@ export function startEditor(filePath?: string): void {
   process.stdout.on('resize', paint);
   process.on('exit', cleanup);
   process.on('SIGINT', () => { void confirmQuit(); });
+  // Signal termination does NOT emit 'exit' (Node docs: 'exit' fires only for
+  // explicit process.exit() or a drained event loop), so without these
+  // handlers `kill <pid>` skipped cleanup() and left raw mode + the alt
+  // screen enabled on the terminal.
+  process.on('SIGTERM', () => quit());
+  process.on('SIGHUP', () => quit());
 }
 
 function resetBufStateKeepFile(): void {
