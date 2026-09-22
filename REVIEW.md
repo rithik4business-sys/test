@@ -71,4 +71,78 @@ Token appears **only** in `Authorization` header — never path/query/logs/error
 
 ---
 
-*(Further agent reports appended below as they land.)*
+---
+
+## Review 3/6 — `src/index.ts`, `src/themes.ts`, `src/winsh.ts` ✅
+
+Agent verified via standalone `node -e` repros + fetched upstream `sst/opencode` theme source for provenance; post-edit re-read only.
+
+### Fixes applied
+| # | Sev | Where | Bug | Proof | Fix | Improvement |
+|---|-----|-------|-----|-------|-----|-------------|
+| 1 | HIGH | `index.ts:11-37` | `ask()` promise **never settles on stdin EOF** → `typewriter --push < /dev/null` exited 0 *silently* (fake success) instead of aborting 130; SIGINT listener leaked | ran repro: `< /dev/null` → `settled=false` after close; Node readline docs: question callback only fires on input | `done` latch + `rl.on('close')` reject; all 3 paths single-settle | prompts abort cleanly (exit 130), no listener leak |
+| 2 | MED | `index.ts:164-177` | Unknown flags **silently ignored**: `--poert=8080` opened empty editor, exit 0 | traced fall-through → `startEditor(undefined)`; `test/tui.test.js:22` passes only plain filename (zero test impact) | known-option allow-list after `--help`/`--version` short-circuits → `Unknown option` + exit 1 | typos fail fast with actionable message |
+| 3 | MED | `index.ts:172-177` | `--port`/`--host` without `--serve` silently discarded (help says "with --serve") | traced: no branch reads them → editor opens, exit 0 | require `--serve` else error + exit 1 | every documented flag form now diagnosable |
+| 4 | MED | `index.ts:203-210` | `--port=abc` → **silent 3000 fallback**; `--port=99999` → raw `RangeError` stack | ran: `parseInt('99999')` finite, range never checked; Node `ERR_SOCKET_BAD_PORT` docs | `Number.isInteger && 0-65535` else one-line error + exit 1; NaN fallback removed | `startServer` only ever gets a legal port |
+| 5 | LOW | `index.ts:225-230` | `process.exit(1)` can truncate piped output (inconsistent with file's own `exitCode` pattern) | Node docs: `process.exit` may exit before stdout flushes; sibling paths already safe | `process.exitCode=1; return` | full diagnostics guaranteed on pipes |
+| 6 | LOW | `index.ts:226` | `--theme --serve` reported "Unknown theme: --serve" instead of "Missing value" | ternary chose on `name?` truthiness; dash-value is truthy | condition `name && !name.startsWith('-')` | correct diagnosis |
+| 7 | HIGH | `themes.ts:34` | **`lucent-orng` theme unreadable: 1.16:1 contrast** — light backgrounds half-swapped into an all-dark palette (white bg + `#eeeeee` text); primary button 3.44:1 | executed WCAG luminance math; fetched upstream `sst/opencode` `lucent-orng.json` — dark defs match the entry's foregrounds exactly, light defs never applied | restored dark `bg/panel/element` (**17.06:1**) + `primaryText #0a0a0a` (**5.75:1** AA) | theme readable + provenance-consistent; no test asserts these colors |
+
+### Open questions (not changed)
+1. ⚠️ **`public/index.html:607` mirrors the same broken `lucent-orng`** — out of scope for this agent → **my queue after agent 6 lands**
+2. Flag-precedence: `--login --logout` resolves by fixed order silently (no test, designed behavior)
+3. Multiple positionals: `a.ts b.ts` opens only `a.ts` — intent unclear
+4. ⚠️ **`server.ts:1568-1574`** standalone `--port` parse duplicates the same missing range check → **my queue after agent 1 lands**
+5. `--theme=a=b` recombination verified harmless · 6. Banner `padEnd(30)` cosmetic overflow if version >30 chars
+
+### Verified clean (attested)
+**`winsh.ts` entire file** matches both contract tests: POSIX escaping of all 4 metacharacters `\ " $ \``, PowerShell `''` doubling (per `about_Quoting_Rules`), `psCommandArgs` order, runner/taskkill maps, `isWindows`='win32' only, pure functions · `ask()` answer path can't double-settle · unknown-option guard provably touches zero test surfaces · `THEME_NAMES` all own-keys (no prototype-leak class from Review 1) · post-fix: every `index.ts` error path uses `exitCode`+`return`, sole `process.exit(1)` is the correct top-level catch.
+
+---
+
+---
+
+## Review 4/6 — `src/server.ts` ✅ (recovered — report never delivered, agent killed mid-run)
+
+**Recovery method:** the agent applied its edits (12:04) but was interrupted before writing its report. Recovered by diffing the session-start baseline compile (`/tmp/dist-orig-baseline/server.js`, preserved from the pre-edit build) against a fresh build of the current source. Proofs are embedded in the agent's own code comments; **verification level = full test suite green (97/97 + 36/36)** — tests directly exercise routes touched by #5, #8, #10, #12; LSP (#4), throttle (#6/#7), and git-status (#13) fixes are code-traced but not covered by tests (noted honestly).
+
+### Fixes applied
+| # | Sev | Where | Bug | Proof | Fix | Improvement |
+|---|-----|-------|-----|-------|-----|-------------|
+| 1 | HIGH | `findAgentBin` | `AGENTS[id]` prototype-chain read: id `'constructor'` → truthy function → `spec.extraPaths` TypeError thrown from exported fn | same bug class proven in Review 1; comment traces exact throw site | own-property guard | prototype ids return null instead of crashing |
+| 2 | MED | `agentStatus()` | **6 blocking `spawnSync` probes (5s/10s timeouts) inside HTTP handler on every request** | comment documents probe count + timeouts | 5s TTL memo cache | polling UI pays blocking scan at most once/window |
+| 3 | MED | `startInstall` | id `'constructor'` → 500 (TypeError) instead of intended 400 | traced: `!spec` passed for truthy function, crash later in findAgentBin | own-property guard | correct 400 'unknown agent' |
+| 4 | HIGH | `lspAccept` stdout parser | **LSP framing ran on a decoded string**: `Content-Length` is BYTES (UTF-16 `.length` under-counts → mis-frames any non-ASCII message); `String(chunk)` corrupts split multi-byte chars; regex `Content-Length...\r\n\r\n` never matched when `Content-Type` header followed → parser stalled until 1MB trim | LSP base-protocol spec (byte count, optional second header); comment traces all three failure modes | `Buffer` accumulation, header-block scan via `\r\n\r\n` + ASCII header parse, junk-block skip, UTF-8 decode of slice | protocol-correct framing; no more stalls/corruption |
+| 5 | MED | `readBody` overflow | `req.destroy()` before 413 response → client saw connection reset, never the 413 | comment: respond-after-destroy delivers nothing | don't destroy; `done` guard ignores rest | clients actually receive 413 |
+| 6 | HIGH | `throttle()` | **X-Forwarded-For trusted from any peer** → client-settable header keyed the rate bucket → unlimited distinct buckets = rate-limit bypass | XFF is client-settable on direct connections; `ip` keys bucket below | trust XFF only when direct peer is loopback | rate limits hold against forged headers |
+| 7 | MED | `rateBuckets` >5000 | blanket `clear()` **reset every client's live window** → all clients could exceed `perMinute` for rest of hour | comment traces: clear drops live `hits` arrays | prune expired windows first; clear only as last-resort bound | rate limiting survives memory pressure |
+| 8 | MED | `parseJsonBody` | unreadable body (oversize/abort) rejection → outer catch → **500 instead of 400** | traced rejection path | try/catch → `null` → caller's 400 | correct client-error status |
+| 9 | HIGH | `idePage()` | **cwd-first resolution served the opened project's own `public/index.html` as the editor UI** — a planted page runs at the editor's origin | `process.cwd()` is the user's opened project; comment states attack | bundled `__dirname`-relative page first, cwd as fallback | arbitrary projects can't inject the editor shell |
+| 10 | HIGH | `/api/raw` + `/icons` | project bytes served without sandbox: **SVG opened directly executes script at editor origin** (could read `localStorage 'tw-token'`, call API); also `ext='constructor'` → MIME_MAP prototype fn → `ERR_HTTP_INVALID_HEADER_VALUE` 500 | comment: CSP not applied to `<img>`, but raw navigation executes; MIME bug = Review-1 class | `Content-Security-Policy: sandbox` on both routes + own-property MIME lookup | script-bearing files can't run at origin; `.constructor` filenames serve (octet-stream) |
+| 11 | MED | `/api/exec` | **`activeExecs` slot leaked** on 400/403 early exits → concurrent-exec capacity permanently shrank until restart | each early return skipped the decrement | `activeExecs--` on every exit path | exec slots can't leak |
+| 12 | LOW | `/api/rename` | missing source → `renameSync` ENOENT → 500 | delete route already answered 404 for same case | `lstatSync` precheck → 404 | consistent with delete |
+| 13 | MED | `/api/git/status` | **branch/ahead/behind always empty/0**: regex required `^## ` but ran against `ln.slice(3)` — the already-stripped prefix → never matched | comment traces double error; branch names with dots also broke pattern | split on `...` upstream marker + separate `[ahead N]` probe; `HEAD` detection for detached | push review shows real branch/divergence |
+| 14 | HIGH | device poll | `device_code` unbounded (readBody allows 5MB) → **200 oversized codes pin ~1GB** as map keys | 200 × 5MB arithmetic in comment; real codes ~40 chars | reject `dc.length > 256` → 400 | memory-pinning DoS closed |
+| 15 | HIGH | standalone `--host=` | empty value → `listen(port,'')` binds **`::` all interfaces**, skipping the loopback warning | Node `listen` semantics; comment traces silent skip | `\|\| '127.0.0.1'` fallback chain | never silently public |
+
+### Open questions
+1. ⚠️ **Still open from Review 3:** standalone port parse (`server.ts` argv block) lacks 0-65535 range check — this agent fixed the `--host=` half but not `--port=`. **My queue.**
+2. Not test-covered: LSP framing, throttle trust rules, git-status parsing — recommend targeted tests in a later pass.
+
+### Verified clean
+Route dispatch chain, auth gating on `/api/*`, `safePath` traversal checks exercised by `test/api.test.js` (8 live-server tests incl. auth + traversal + binary) — all green post-change.
+
+---
+
+## Review status after subagent shutdown (user-ordered)
+
+| Review | Scope | State |
+|---|---|---|
+| 1/6 utils+structures+complete+highlight | 7 fixes | ✅ delivered + merged |
+| 2/6 github+collect | 7 fixes | ✅ delivered + merged |
+| 3/6 index+themes+winsh | 7 fixes | ✅ delivered + merged |
+| 4/6 server.ts | 15 fixes | ✅ recovered from baseline-diff, merged (this entry) |
+| 5/6 editor.ts | — | ❌ agent killed mid-run; **file never touched** (mtime unchanged, zero diff) — review still owed |
+| 6/6 public/index.html | partial | ⚠️ agent killed; applied 2 correct fixes before death (`lucent-orng` contrast mirror, literal `\u2014` → em-dash) — remainder of review still owed |
+
+*(Further entries appended as remaining reviews are completed.)*
