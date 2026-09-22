@@ -272,7 +272,7 @@ Claude Code · OpenCode · Codex buttons sit in the top bar with a status dot (g
 ## v1.2.0 additions
 
 ### Vim grammar (both UIs)
-Counts (`3j d2w`), operators (`d/c/y` + motions, `dd yy cc`), text objects (`ci" di( daw`), macros (`qa…q @a @@`). TUI also: `e` motion, `G` with count.
+Counts (`3j d2w`), operators (`d/c/y` + motions, `dd yy cc`), text objects (`ci" di( daw`), macros (`qa…q @a @@`), visual select (`v` char / `V` line, `o` swaps ends, `d y c x p` act), dot-repeat (`.`), marks (`ma 'a mA`, `` `` last jump), jumplist (`Ctrl+O` back, `Ctrl+I` forward). TUI also: `e` motion, `G` with count. Visual ops and completion ghosts are not dot-recorded. TUI: `Tab` in normal mode is jump-forward (`Ctrl+G` cycles panes instead); web `Tab` keeps inserting spaces.
 
 ### TUI buffers + splits
 `:ls :bn :bp :b :bd` with dirty guards · `:sp [file]` horizontal split (independent scroll, `▌` marks active pane) · `:only` · `Ctrl+W` switches pane.

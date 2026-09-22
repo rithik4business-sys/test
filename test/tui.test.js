@@ -67,6 +67,23 @@ test('G jumps to last line (vim motion)', { skip: !pty, timeout: 30000 }, async 
   } finally { t.p.kill(); }
 });
 
+test('ghost completion appears and Tab accepts it', { skip: !pty, timeout: 30000 }, async () => {
+  const t = spawnEditor('g.py');
+  try {
+    assert.ok(await waitFor(t, /g\.py/));
+    await new Promise((r) => setTimeout(r, 500)); // let startup settle or 'i' lands pre-ready
+    t.p.write('ifor');
+    assert.ok(await waitFor(t, /for x in xs:/, 8000), 'python snippet ghost visible, got tail: ' + JSON.stringify(t.get().slice(-200)));
+    t.p.write('\x09');
+    await new Promise((r) => setTimeout(r, 400));
+    t.p.write('\x1b');
+    await new Promise((r) => setTimeout(r, 300));
+    t.p.write(':w\r');
+    assert.ok(await waitFor(t, /Saved/, 8000), 'save confirmed');
+    assert.equal(fs.readFileSync(path.join(dir, 'g.py'), 'utf-8'), 'for x in xs:');
+  } finally { try { t.p.kill(); } catch {} }
+});
+
 test('insert, save, quit writes file', { skip: !pty, timeout: 30000 }, async () => {
   const t = spawnEditor('b.txt');
   try {
@@ -96,4 +113,53 @@ test(':theme switches, :sp splits, :only unsplits', { skip: !pty, timeout: 30000
     await new Promise((r) => setTimeout(r, 400));
     t.p.write(':q!\r');
   } finally { try { t.p.kill(); } catch {} }
+});
+
+test('visual mode highlights and deletes a selection', { skip: !pty, timeout: 30000 }, async () => {
+  fs.writeFileSync(path.join(dir, 'v.txt'), 'alpha\nbeta\ngamma\n');
+  const t = spawnEditor('v.txt');
+  try {
+    assert.ok(await waitFor(t, /v\.txt/));
+    t.p.write('v');
+    assert.ok(await waitFor(t, /VISUAL/), 'statusline shows VISUAL');
+    t.p.write('jj');
+    await new Promise((r) => setTimeout(r, 400));
+    t.p.write('d');
+    await new Promise((r) => setTimeout(r, 400));
+    t.p.write(':w\r');
+    assert.ok(await waitFor(t, /Saved/, 8000), 'save confirmed');
+    assert.equal(fs.readFileSync(path.join(dir, 'v.txt'), 'utf-8'), 'amma\n');
+  } finally { t.p.kill(); }
+});
+
+test('dot repeats the last change (x)', { skip: !pty, timeout: 30000 }, async () => {
+  fs.writeFileSync(path.join(dir, 'd.txt'), 'one\ntwo\nthree\n');
+  const t = spawnEditor('d.txt');
+  try {
+    assert.ok(await waitFor(t, /d\.txt/));
+    t.p.write('x');
+    await new Promise((r) => setTimeout(r, 400));
+    t.p.write('.');
+    await new Promise((r) => setTimeout(r, 400));
+    t.p.write(':w\r');
+    assert.ok(await waitFor(t, /Saved/, 8000), 'save confirmed');
+    assert.equal(fs.readFileSync(path.join(dir, 'd.txt'), 'utf-8'), 'e\ntwo\nthree\n');
+  } finally { t.p.kill(); }
+});
+
+test('marks and jumplist navigate (ma, G, quote-a, Ctrl-O)', { skip: !pty, timeout: 30000 }, async () => {
+  const t = spawnEditor('a.txt');
+  try {
+    assert.ok(await waitFor(t, /a\.txt/));
+    t.p.write('ma');
+    await new Promise((r) => setTimeout(r, 300));
+    t.p.write('G');
+    assert.ok(await waitFor(t, /4:1 4L/, 8000), 'G went to last line');
+    t.p.write("'a");
+    assert.ok(await waitFor(t, /1:1 4L/, 8000), "'a jumped back to mark, got tail: " + JSON.stringify(t.get().slice(-160)));
+    t.p.write('G');
+    assert.ok(await waitFor(t, /4:1 4L/, 8000), 'G again');
+    t.p.write('\x0f');
+    assert.ok(await waitFor(t, /1:1 4L/, 8000), 'Ctrl-O walked jumplist back, got tail: ' + JSON.stringify(t.get().slice(-160)));
+  } finally { t.p.kill(); }
 });

@@ -49,6 +49,7 @@ const gh = __importStar(require("./github"));
 const collect_1 = require("./collect");
 Object.defineProperty(exports, "collectProjectFiles", { enumerable: true, get: function () { return collect_1.collectProjectFiles; } });
 const structures_1 = require("./structures");
+const winsh_1 = require("./winsh");
 const ROOT = path.resolve(process.cwd());
 const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', '.vscode', '.idea']);
 const MIME_MAP = {
@@ -1162,7 +1163,7 @@ function startServer(port = 3000, host = '127.0.0.1') {
                     }
                     const shell = process.platform === 'win32' ? 'powershell.exe' : 'sh';
                     const args = process.platform === 'win32'
-                        ? ['-NoProfile', '-NonInteractive', '-Command', cmd]
+                        ? (0, winsh_1.psCommandArgs)(cmd)
                         : ['-c', cmd];
                     const shellName = process.platform === 'win32' ? 'powershell' : 'sh';
                     try {
@@ -1895,6 +1896,11 @@ function startServer(port = 3000, host = '127.0.0.1') {
                         sendJson(res, 200, (list || []).map((b) => ({ name: b.name, sha: b.commit?.sha?.slice(0, 7) || '' })));
                     }
                     catch (e) {
+                        // Empty repo: branch listing is legitimately empty, not an error.
+                        if (gh.isEmptyRepo(e)) {
+                            sendJson(res, 200, []);
+                            return;
+                        }
                         ghError(res, e);
                     }
                     return;
@@ -1926,6 +1932,27 @@ function startServer(port = 3000, host = '127.0.0.1') {
                     catch (e) {
                         ghError(res, e);
                     }
+                    return;
+                }
+                // ---- push file preview (what a push would send — same collector) ----
+                if (url.pathname === '/api/github/push/files' && req.method === 'GET') {
+                    if (!needAuth(req, url, res))
+                        return;
+                    const token = ghToken();
+                    if (!token) {
+                        sendJson(res, 409, { error: 'github not connected' });
+                        return;
+                    }
+                    const files = (0, collect_1.collectProjectFiles)(ROOT);
+                    const list = [];
+                    let totalBytes = 0;
+                    for (const [rel, content] of files) {
+                        const b = Buffer.byteLength(content);
+                        totalBytes += b;
+                        if (list.length < 500)
+                            list.push({ p: rel, bytes: b });
+                    }
+                    sendJson(res, 200, { files: list, total: files.size, totalBytes, capped: files.size > 500 });
                     return;
                 }
                 if (url.pathname === '/api/github/push' && req.method === 'POST') {

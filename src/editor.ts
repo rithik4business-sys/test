@@ -5,6 +5,7 @@ import * as readline from 'readline';
 import { spawn, spawnSync } from 'child_process';
 import { shellFor, shellQuote, runnerFor, taskkillArgs } from './winsh';
 import { highlightLine, stripAnsi, HighlightPalette } from './highlight';
+import { suggestCompletion } from './complete';
 import { getLanguageFromExt, getFileExtension, readFileSync, writeFileSync, fileExists, loadConfig, saveConfig, isBinaryFile, loadSession, saveSession, scheduleSessionSave, flushSession } from './utils';
 import { THEME_NAMES, getTheme, DEFAULT_THEME, isThemeName } from './themes';
 import { RingBuffer, LinkedStack } from './structures';
@@ -99,6 +100,7 @@ function _seq(kind: 38 | 48, h: string): string {
 const fg = (h: string) => _seq(38, h);
 const bg = (h: string) => _seq(48, h);
 const RESET = '\x1b[0m';
+const REV = '\x1b[7m';
 const BOLD = '\x1b[1m';
 /** Display width: CJK/emoji count 2, combining marks 0, everything else 1. */
 function strWidth(s: string): number {
@@ -231,6 +233,7 @@ function snapshot(): void {
 }
 
 function undo(): void {
+  visualExit();
   const s = undoStack.pop();
   if (!s) return say('Nothing to undo', true);
   redoStack.push({ lines: [...buf.lines], cx: buf.cx, cy: buf.cy });
@@ -240,6 +243,7 @@ function undo(): void {
 }
 
 function redo(): void {
+  visualExit();
   const s = redoStack.pop();
   if (!s) return say('Nothing to redo', true);
   undoStack.push({ lines: [...buf.lines], cx: buf.cx, cy: buf.cy });
@@ -392,15 +396,63 @@ function paintTreeRow(y: number, tw: number): string {
   return padVis(fg(T.muted) + label + RESET, tw);
 }
 
-function paintCodeRow(y: number, sy: number, digits: number, ew: number, cw: number, B: Buf = buf): string {
+let ghostText = '';
+let ghostKey = '';
+/** Ghost suffix for the active cursor row (empty unless caret sits at end of line). */
+function ghostFor(B: Buf, isActive: boolean): string {
+  if (!isActive || focus !== 'edit') { return ''; }
+  const line = B.lines[B.cy] ?? '';
+  if (B.cx !== line.length) return '';
+  const key = B.lang + '\n' + B.cy + '\n' + line;
+  if (key === ghostKey) return ghostText;
+  ghostKey = key;
+  const c = suggestCompletion({ prefix: line, after: '', lines: B.lines, lang: B.lang });
+  ghostText = c ? c.text : '';
+  return ghostText;
+}
+/** Append as many ghost chars as fit in the remaining width (width-safe). */
+function fitGhost(ghost: string, used: number, ew: number): { s: string; w: number } {
+  let w = 0;
+  let out = '';
+  for (const ch of ghost) {
+    const cw = strWidth(ch);
+    if (used + w + cw > ew) break;
+    out += ch;
+    w += cw;
+  }
+  return { s: out, w };
+}
+function paintCodeRow(y: number, sy: number, digits: number, ew: number, cw: number, B: Buf = buf, isActive = false, liveSel = true): string {
   const idx = sy + (y - 1);
   if (idx >= B.lines.length) return ' '.repeat(cw);
   const n = String(idx + 1).padStart(digits, ' ');
   const num = idx === B.cy ? fg(T.primary) + BOLD + n + RESET : fg(T.muted) + n + RESET;
-  const raw = (B.lines[idx] ?? '').substring(B.sx, B.sx + ew);
-  const e = hlEntry(raw, B.lang);
-  const h = e.h;
-  const hLen = e.w;
+  const lineFull = B.lines[idx] ?? '';
+  const raw = lineFull.substring(B.sx, B.sx + ew);
+  let h: string;
+  let hLen: number;
+  const span = liveSel ? visRowSpan(idx, lineFull.length) : null;
+  const selShown = !!span && Math.min(span[1], B.sx + ew) > Math.max(span[0], B.sx);
+  if (selShown) {
+    // Selected rows drop syntax colors (and ghost text) for reverse video —
+    // vim's Visual group overrides highlighting too. Built from raw text, so
+    // no ANSI remapping is needed.
+    const rs = Math.max(span[0], B.sx);
+    const re = Math.min(span[1], B.sx + ew);
+    h = lineFull.substring(B.sx, rs) + REV + lineFull.substring(rs, re) + RESET + lineFull.substring(re, B.sx + ew);
+    hLen = visLen(h);
+  } else {
+    const e = hlEntry(raw, B.lang);
+    h = e.h;
+    hLen = e.w;
+  }
+  if (idx === B.cy && !selShown) {
+    const g = ghostFor(B, isActive);
+    if (g && hLen < ew) {
+      const f = fitGhost(g, hLen, ew);
+      if (f.s) { h += fg(T.muted) + f.s + RESET; hLen += f.w; }
+    }
+  }
   const padded = hLen >= ew ? h : h + ' '.repeat(ew - hLen);
   const full = `${num} ${padded}`;
   const fullLen = digits + 1 + Math.max(hLen, ew);
@@ -439,8 +491,9 @@ function paintTerm(row: string[], termH: number, w: number): void {
 }
 
 function paintStatus(row: string[], w: number): void {
-  const modeName = vim === 'normal' ? 'NORMAL' : vim === 'insert' ? 'INSERT' : vim === 'command' ? 'COMMAND' : 'SEARCH';
-  const modeBg = vim === 'insert' ? bg(T.green) : vim === 'normal' ? bg(T.primary) : bg(T.accent);
+  const vmode = visual ? (visual.kind === 'line' ? 'VISUAL LINE' : 'VISUAL') : null;
+  const modeName = vmode ?? (vim === 'normal' ? 'NORMAL' : vim === 'insert' ? 'INSERT' : vim === 'command' ? 'COMMAND' : 'SEARCH');
+  const modeBg = visual ? bg(T.accent) : vim === 'insert' ? bg(T.green) : vim === 'normal' ? bg(T.primary) : bg(T.accent);
   const mode = `${modeBg}${fg(T.primaryText)}${BOLD} ${modeName} ${RESET}`;
   const name = buf.filePath ? path.basename(buf.filePath) : 'untitled';
   const mid = msg
@@ -469,6 +522,7 @@ function layoutRegions(h: number, termH: number): Region[] {
 
 function paint(): void {
   const { w, h } = size();
+  syncVisual();
   const rows: string[] = [];
   paintHeader(rows, w);
   const termH = termOpen ? termHeightFor(h) : 0;
@@ -480,7 +534,9 @@ function paint(): void {
   const regions = layoutRegions(h, termH);
   let curDigits = 1, curEw = 10, curY0 = 1;
   for (const rg of regions) {
-    const B = buffers[rg.bi]?.b ?? buf;
+    // Active pane always renders the live buffer: entry copies only refresh
+    // on stash (buffer/pane switches), so rendering them shows a stale snapshot.
+    const B = rg.active ? buf : (buffers[rg.bi]?.b ?? buf);
     const digits = String(B.lines.length).length;
     const ew = Math.max(10, cw - digits - 2);
     syncCodeScroll(rg.y1 - rg.y0, ew, B);
@@ -493,7 +549,7 @@ function paint(): void {
         const tag = rg.active ? fg(T.primary) + '▌' + RESET : fg(T.borderSubtle) + '▌' + RESET;
         line.push(tag);
       }
-      line.push(paintCodeRow(y, B.sy, digits, ew, splitOn ? cw - 1 : cw, B));
+      line.push(paintCodeRow(y, B.sy, digits, ew, splitOn ? cw - 1 : cw, B, rg.active, rg.bi === curIdx()));
       rows.push(padVis(line.join(''), w));
     }
     if (rg.active) { curDigits = digits; curEw = ew; curY0 = rg.y0; }
@@ -705,6 +761,137 @@ let lastReg = '';
 let playing = false;
 const regs: Record<string, string> = {};
 
+/* ---------- visual mode (v char-wise, V line-wise) ---------- */
+type VisKind = 'char' | 'line';
+let visual: { kind: VisKind; ay: number; ax: number } | null = null;
+/** Selection bounds in line/col space, recomputed once per paint (O(1) per
+ * row afterwards — never per-row offset math). */
+let visHL: { y1: number; x1: number; y2: number; x2: number; line: boolean } | null = null;
+function visualExit(): void { visual = null; visHL = null; }
+function syncVisual(): void {
+  visHL = null;
+  if (!visual) return;
+  const n = buf.lines.length;
+  const ay = clamp(visual.ay, 0, n - 1);
+  const ax = clamp(visual.ax, 0, (buf.lines[ay] ?? '').length);
+  const cy = clamp(buf.cy, 0, n - 1);
+  const cx = clamp(buf.cx, 0, (buf.lines[cy] ?? '').length);
+  if (visual.kind === 'line') {
+    visHL = { y1: Math.min(ay, cy), x1: 0, y2: Math.max(ay, cy), x2: -1, line: true };
+    return;
+  }
+  const adv = (y: number, x: number): [number, number] => {
+    const len = (buf.lines[y] ?? '').length;
+    if (x < len) return [y, x + 1];
+    if (y + 1 < n) return [y + 1, 0];
+    return [y, x];
+  };
+  const aFirst = ay < cy || (ay === cy && ax <= cx);
+  const s: [number, number] = aFirst ? [ay, ax] : [cy, cx];
+  const hp: [number, number] = aFirst ? [cy, cx] : [ay, ax];
+  const e = adv(hp[0], hp[1]);
+  visHL = { y1: s[0], x1: s[1], y2: e[0], x2: e[1], line: false };
+}
+/** Selected span of row idx as [startCol, endCol) in line coords, or null. */
+function visRowSpan(idx: number, len: number): [number, number] | null {
+  const h = visHL;
+  if (!h || idx < h.y1 || idx > h.y2) return null;
+  if (h.line) return len > 0 ? [0, len] : null;
+  const s = idx === h.y1 ? Math.min(h.x1, len) : 0;
+  const e = idx === h.y2 ? Math.min(h.x2, len) : len;
+  return e > s ? [s, e] : null;
+}
+/** Selection as ordered text offsets (end exclusive). */
+function visOffsets(): [number, number] {
+  if (!visual) return [0, 0];
+  if (visual.kind === 'line') {
+    const y1 = Math.min(visual.ay, buf.cy);
+    const y2 = Math.max(visual.ay, buf.cy);
+    return [offOf(y1, 0), y2 + 1 < buf.lines.length ? offOf(y2 + 1, 0) : offOf(y2, (buf.lines[y2] ?? '').length)];
+  }
+  syncVisual();
+  const h = visHL!;
+  return [offOf(h.y1, h.x1), offOf(h.y2, h.x2)];
+}
+
+/* ---------- dot-repeat: keystroke recording of the last change ---------- */
+let dotKeys: string[] | null = null;
+let replayingDot = false;
+let insEntry: string[] | null = null;
+let insChars: string[] = [];
+function setDot(keys: string[]): void {
+  if (!replayingDot && keys.length) dotKeys = [...keys];
+}
+function insBegin(keys: string[]): void {
+  if (!replayingDot) { insEntry = [...keys]; insChars = []; }
+}
+function insPush(key: string): void {
+  if (insEntry && !replayingDot) insChars.push(key);
+}
+function insEnd(): void {
+  if (insEntry && !replayingDot) setDot([...insEntry, ...insChars]);
+  insEntry = null; insChars = [];
+}
+
+/* ---------- marks (a-z per file, A-Z global) + jumplist ---------- */
+interface JumpPos { file: string | null; y: number; x: number }
+const localMarks = new Map<string, Map<string, { y: number; x: number }>>();
+const globalMarks = new Map<string, JumpPos>();
+let markWait = false;
+let tickWait: null | 'line' | 'exact' = null;
+let jumps: JumpPos[] = [];
+let jumpIdx = -1;
+let lastJump: JumpPos | null = null;
+function markFileKey(): string | null { return buf.filePath ?? null; }
+function curPos(): JumpPos { return { file: markFileKey(), y: buf.cy, x: buf.cx }; }
+function getMark(name: string): JumpPos | null {
+  if (name >= 'a' && name <= 'z') {
+    const m = localMarks.get(markFileKey() ?? 'untitled')?.get(name);
+    return m ? { file: markFileKey(), y: m.y, x: m.x } : null;
+  }
+  if (name >= 'A' && name <= 'Z') return globalMarks.get(name) ?? null;
+  return null;
+}
+/** Record the pre-jump position (cap 100). Explicit jumps only — never
+ * per-keystroke search typing or visual drags. */
+function pushJump(): void {
+  const p = curPos();
+  lastJump = p;
+  jumps = jumps.slice(0, jumpIdx + 1);
+  jumps.push(p);
+  if (jumps.length > 100) jumps.shift();
+  jumpIdx = jumps.length - 1;
+}
+function gotoPos(p: JumpPos): boolean {
+  const here = markFileKey();
+  if (p.file !== here) {
+    if (buf.modified) { say('Unsaved changes — :w first', true); return false; }
+    const idx = buffers.findIndex((e) => (e.b.filePath ?? null) === p.file);
+    if (idx >= 0 && idx !== curIdx()) { stashBuf(); loadBuf(idx); panes[activePane] = idx; }
+    else if (idx < 0) {
+      if (!p.file || !fileExists(p.file)) { say('Jump target gone', true); return false; }
+      if (!openFile(p.file)) return false;
+    }
+  }
+  buf.cy = clamp(p.y, 0, buf.lines.length - 1);
+  buf.cx = clamp(p.x, 0, (buf.lines[buf.cy] ?? '').length);
+  return true;
+}
+function jumpBack(): void {
+  if (jumpIdx <= 0) { say('At oldest jump', true); return; }
+  lastJump = curPos();
+  jumpIdx--;
+  if (!gotoPos(jumps[jumpIdx])) { jumpIdx++; return; }
+  say(`Jump ${jumpIdx + 1}/${jumps.length}`);
+}
+function jumpFwd(): void {
+  if (jumpIdx >= jumps.length - 1) { say('At newest jump', true); return; }
+  lastJump = curPos();
+  jumpIdx++;
+  if (!gotoPos(jumps[jumpIdx])) { jumpIdx--; return; }
+  say(`Jump ${jumpIdx + 1}/${jumps.length}`);
+}
+
 function bufText(): string { return buf.lines.join('\n'); }
 function offOf(y: number, x: number): number {
   let o = 0;
@@ -833,7 +1020,7 @@ function objRange(text: string, o: number, ch: string, around: boolean): [number
   return around ? [l, r + 1] : [l + 1, r];
 }
 function recordKey(k: string): void {
-  if (!recReg || playing) return;
+  if (!recReg || playing || replayingDot) return;
   regs[recReg] = (regs[recReg] ?? '') + k;
   if (regs[recReg].length > 500) { recReg = null; say('Macro too long — stopped', true); }
 }
@@ -860,6 +1047,71 @@ function vimKey(key: string): boolean {
     else if (/^[a-z]$/.test(key)) playReg(key, nn);
     return true;
   }
+  if (markWait) {
+    markWait = false;
+    if (/^[a-z]$/.test(key)) {
+      const fk = markFileKey() ?? 'untitled';
+      let m = localMarks.get(fk);
+      if (!m) { m = new Map(); localMarks.set(fk, m); }
+      m.set(key, { y: buf.cy, x: buf.cx });
+      say(`Mark ${key}`);
+      return true;
+    }
+    if (/^[A-Z]$/.test(key)) {
+      globalMarks.set(key, curPos());
+      say(`Mark ${key}`);
+      return true;
+    }
+    // Not a mark name — fall through and handle the key normally.
+  }
+  if (tickWait) {
+    const t = tickWait; tickWait = null;
+    const isTick = key === "'" || key === '`';
+    const isName = /^[a-zA-Z]$/.test(key);
+    if (isTick || isName) {
+      const target = isTick ? lastJump : getMark(key);
+      if (!target) { say(isTick ? 'No previous jump' : `Mark ${key} not set`, true); return true; }
+      lastJump = curPos();
+      if (gotoPos(target) && t === 'line') {
+        const l = curLine();
+        const m = l.search(/\S|$/);
+        buf.cx = m < 0 ? 0 : m;
+      }
+      clampCur();
+      return true;
+    }
+    // else: fall through and handle the key normally.
+  }
+  if (visual) {
+    if (key === '\x1b') { visualExit(); return true; }
+    if (key === 'v') {
+      if (visual.kind === 'char') visualExit();
+      else visual = { kind: 'char', ay: visual.ay, ax: visual.ax };
+      return true;
+    }
+    if (key === 'V') { visual = { kind: 'line', ay: visual.ay, ax: visual.ax }; return true; }
+    if (key === 'o') {
+      const ty = visual.ay, tx = visual.ax;
+      visual.ay = buf.cy; visual.ax = buf.cx; buf.cy = ty; buf.cx = tx; clampCur();
+      return true;
+    }
+    if (key === 'd' || key === 'x') { const r = visOffsets(); visualExit(); delRange(r[0], r[1]); return true; }
+    if (key === 'y') {
+      if (visual.kind === 'line') {
+        const y1 = Math.min(visual.ay, buf.cy), y2 = Math.max(visual.ay, buf.cy);
+        yank = buf.lines.slice(y1, y2 + 1).join('\n'); yankStr = yank; yankMode = 'line';
+        osc52Copy(yankStr); say(`Yanked ${y2 - y1 + 1} line(s)`);
+      } else { const r = visOffsets(); yankRange(r[0], r[1]); }
+      visualExit(); return true;
+    }
+    if (key === 'c') { const r = visOffsets(); visualExit(); delRange(r[0], r[1]); vim = 'insert'; insBegin([]); return true; }
+    if (key === 'p') {
+      if (!yankStr && !yank) { say('Nothing yanked', true); return true; }
+      const r = visOffsets(); visualExit(); delRange(r[0], r[1]); doPaste(); return true;
+    }
+    if (key === '.') return true; // repeat-over-selection is not recorded; ignore
+    // Motions, marks, jumps and G fall through and stretch the selection.
+  }
   if (vObj) {
     const o = vObj; vObj = null; vCount = 0;
     const cur = offOf(buf.cy, buf.cx);
@@ -867,8 +1119,9 @@ function vimKey(key: string): boolean {
     if (key === 'w' || key === 'W') range = objRange(bufText(), cur, 'w', o.around);
     else if (key.length === 1) range = objRange(bufText(), cur, key, o.around);
     if (!range) return true;
+    setDot([o.op, o.around ? 'a' : 'i', key]);
     if (o.op === 'y') yankRange(range[0], range[1]);
-    else { delRange(range[0], range[1]); if (o.op === 'c') vim = 'insert'; }
+    else { delRange(range[0], range[1]); if (o.op === 'c') { vim = 'insert'; insBegin([o.op, o.around ? 'a' : 'i', key]); } }
     return true;
   }
   if (key === 'q') {
@@ -880,7 +1133,7 @@ function vimKey(key: string): boolean {
   recordKey(key);
   if (/^[1-9]$/.test(key) || (key === '0' && vCount > 0)) { vCount = vCount * 10 + parseInt(key, 10); return true; }
   if (key === 'g') {
-    if (vG) { vG = false; vCount = 0; gotoOff(0); }
+    if (vG) { vG = false; vCount = 0; if (!visual && buf.cy !== 0) pushJump(); gotoOff(0); }
     else vG = true;
     return true;
   }
@@ -891,6 +1144,7 @@ function vimKey(key: string): boolean {
     const op = vOp; vOp = null;
     if ((key === 'd' && op.op === 'd') || (key === 'y' && op.op === 'y') || (key === 'c' && op.op === 'c')) {
       const total = op.n * n;
+      setDot(total > 1 ? [op.op, String(total), key] : [op.op, key]);
       if (op.op === 'y') {
         const lines = buf.lines.slice(buf.cy, buf.cy + total);
         yank = lines.join('\n'); yankStr = yank; yankMode = 'line';
@@ -918,15 +1172,36 @@ function vimKey(key: string): boolean {
       const to = key === 'G' ? offOf(buf.lines.length - 1, 0)
         : key === '$' ? lineEndExcl(from)
         : motionTarget(key, from, op.n * n);
+      const mult = op.n * n;
+      const entry = mult > 1 ? [op.op, String(mult), key] : [op.op, key];
+      setDot(entry);
       if (op.op === 'y') yankRange(from, to);
-      else { delRange(from, to); if (op.op === 'c') vim = 'insert'; }
+      else { delRange(from, to); if (op.op === 'c') { vim = 'insert'; insBegin(entry); } }
       return true;
     }
     return true;
   }
+  if (key === 'v' || key === 'V') {
+    vOp = null; vObj = null; vCount = 0; vG = false; markWait = false; tickWait = null;
+    visual = { kind: key === 'v' ? 'char' : 'line', ay: buf.cy, ax: buf.cx };
+    return true;
+  }
+  if (key === '.') {
+    if (!dotKeys) { say('Nothing to repeat', true); return true; }
+    const nn = vCount || 1; vCount = 0;
+    replayingDot = true;
+    try { for (let k = 0; k < nn; k++) for (const dk of dotKeys) onKey(dk); }
+    finally { replayingDot = false; }
+    if (vim === 'insert') { vim = 'normal'; clampCur(); }
+    return true;
+  }
+  if (key === 'm') { markWait = true; vCount = 0; return true; }
+  if (key === "'" || key === '`') { tickWait = key === "'" ? 'line' : 'exact'; vCount = 0; return true; }
+  if (key === '\x0f') { visualExit(); jumpBack(); return true; } // Ctrl+O — jumplist back
   if (key === 'd' || key === 'y' || key === 'c') { vOp = { op: key, n }; return true; }
   if (key === 'x') {
     if (buf.cx < curLine().length) {
+      setDot(n > 1 ? [String(n), 'x'] : ['x']);
       snapshot();
       buf.lines[buf.cy] = curLine().slice(0, buf.cx) + curLine().slice(buf.cx + n);
       buf.cx = clamp(buf.cx, 0, curLine().length);
@@ -934,22 +1209,24 @@ function vimKey(key: string): boolean {
     }
     return true;
   }
-  if (key === 'p') {
-    if (!yankStr && !yank) { say('Nothing yanked', true); return true; }
-    snapshot();
-    if (yankMode === 'line' || !yankStr) {
-      buf.lines.splice(buf.cy + 1, 0, ...(yank || yankStr).split('\n'));
-      buf.cy = Math.min(buf.cy + 1, buf.lines.length - 1);
-    } else {
-      buf.lines[buf.cy] = curLine().slice(0, buf.cx) + yankStr + curLine().slice(buf.cx);
-      buf.cx += yankStr.length;
-    }
-    clampCur(); buf.modified = true;
-    return true;
+  if (key === 'p') { setDot(['p']); doPaste(); return true; }
+function doPaste(): void {
+  if (!yankStr && !yank) { say('Nothing yanked', true); return; }
+  snapshot();
+  if (yankMode === 'line' || !yankStr) {
+    buf.lines.splice(buf.cy + 1, 0, ...(yank || yankStr).split('\n'));
+    buf.cy = Math.min(buf.cy + 1, buf.lines.length - 1);
+  } else {
+    buf.lines[buf.cy] = curLine().slice(0, buf.cx) + yankStr + curLine().slice(buf.cx);
+    buf.cx += yankStr.length;
   }
+  clampCur(); buf.modified = true;
+}
   if (VIM_MOTIONS.includes(key)) { gotoOff(motionTarget(key, offOf(buf.cy, buf.cx), n)); return true; }
   if (key === 'G') {
-    gotoOff(hadCount ? offOf(clamp(n - 1, 0, buf.lines.length - 1), 0) : offOf(buf.lines.length - 1, 0));
+    const ty = hadCount ? clamp(n - 1, 0, buf.lines.length - 1) : buf.lines.length - 1;
+    if (!visual && ty !== buf.cy) pushJump();
+    gotoOff(offOf(ty, 0));
     return true;
   }
   return false;
@@ -1331,7 +1608,7 @@ function runCmd(raw: string): void {
       break;
     case 'themes': say(`themes: ${THEME_NAMES.join(', ')}`, true); break;
     case 'commands': say(`themes: ${THEME_NAMES.join(', ')} — :theme <name>`, true); break;
-    case 'help': say(':w :q :e :new :bn/:bp/:ls/:bd · :sp/:only Ctrl+W · :s :rm :mv :run · :theme · :set mouse · :!cmd :term[+/- /max] · term: cd/clear/exit/history/pwd · vim: counts d/c/y/i-a q/@ Ctrl+N', true); break;
+    case 'help': say(':w :q :e :new :bn/:bp/:ls/:bd · :sp/:only Ctrl+W · :s :rm :mv :run · :theme · :set mouse · :!cmd :term[+/- /max] · term: cd/clear/exit/history/pwd · vim: counts d/c/y/i-a q/@ Ctrl+N · v/V visual o d/y/c · . repeat · ma \'a mA Ctrl+O Tab jumps', true); break;
     case '':
       break;
     default:
@@ -1389,25 +1666,27 @@ const CSI_MAP: Record<string, string> = { A: 'UP', B: 'DOWN', C: 'RIGHT', D: 'LE
 
 function editNormal(key: string): void {
   switch (key) {
-    case 'i': vim = 'insert'; break;
-    case 'I': buf.cx = 0; vim = 'insert'; break;
-    case 'a': buf.cx = Math.min(buf.cx + 1, curLine().length); vim = 'insert'; break;
-    case 'A': buf.cx = curLine().length; vim = 'insert'; break;
-    case 'o': buf.cx = curLine().length; newline(); vim = 'insert'; break;
-    case 'O': snapshot(); buf.lines.splice(buf.cy, 0, ''); buf.cx = 0; buf.modified = true; vim = 'insert'; break;
-    case ':': vim = 'command'; cmdBuf = ''; break;
-    case '/': vim = 'search'; searchBuf = ''; matches = []; matchIdx = -1; matchCapped = false; break;
-    case 'n': if (matches.length) { matchIdx = (matchIdx + 1) % matches.length; jumpMatch(); } break;
-    case 'N': if (matches.length) { matchIdx = (matchIdx - 1 + matches.length) % matches.length; jumpMatch(); } break;
+    case 'i': vim = 'insert'; insBegin(['i']); break;
+    case 'I': buf.cx = 0; vim = 'insert'; insBegin(['I']); break;
+    case 'a': buf.cx = Math.min(buf.cx + 1, curLine().length); vim = 'insert'; insBegin(['a']); break;
+    case 'A': buf.cx = curLine().length; vim = 'insert'; insBegin(['A']); break;
+    case 'o': buf.cx = curLine().length; newline(); vim = 'insert'; insBegin(['o']); break;
+    case 'O': snapshot(); buf.lines.splice(buf.cy, 0, ''); buf.cx = 0; buf.modified = true; vim = 'insert'; insBegin(['O']); break;
+    case ':': visualExit(); vim = 'command'; cmdBuf = ''; break;
+    case '/': visualExit(); vim = 'search'; searchBuf = ''; matches = []; matchIdx = -1; matchCapped = false; break;
+    case 'n': if (matches.length) { if (!visual) pushJump(); matchIdx = (matchIdx + 1) % matches.length; jumpMatch(); } break;
+    case 'N': if (matches.length) { if (!visual) pushJump(); matchIdx = (matchIdx - 1 + matches.length) % matches.length; jumpMatch(); } break;
     case '0': buf.cx = 0; break;
     case '$': buf.cx = curLine().length; break;
     case 'D':
+      setDot(['D']);
       snapshot();
       buf.lines[buf.cy] = curLine().slice(0, buf.cx);
       buf.modified = true;
       break;
     case 'DEL': // Delete key
       if (buf.cx < curLine().length) {
+        setDot(['DEL']);
         snapshot();
         buf.lines[buf.cy] = curLine().slice(0, buf.cx) + curLine().slice(buf.cx + 1);
         buf.modified = true;
@@ -1470,12 +1749,20 @@ function onKey(key: string): void {
       termOpen = !termOpen;
       focus = termOpen ? 'term' : 'edit';
     } else if (vim === 'insert' && focus === 'edit') {
-      recordKey('  ');
-      insertText('  ');
+      const g = ghostFor(buf, true);
+      if (g && buf.cx === curLine().length) {
+        recordKey(g);
+        insertText(g);
+      } else {
+        recordKey('  ');
+        insPush('\x09');
+        insertText('  ');
+      }
     } else if (focus === 'term') {
       termOpen = false;
       focus = 'edit';
-    } else cycleFocus();
+    } else if (vim === 'normal' && focus === 'edit') { jumpFwd(); } // Tab == Ctrl+I (vim conflation)
+    else cycleFocus();
     paint();
     return;
   } // Tab (Space+Tab toggles terminal; Tab indents in insert; Tab in terminal closes it)
@@ -1485,6 +1772,7 @@ function onKey(key: string): void {
     paint();
     return;
   } else clearLeader();
+  if (key === '\x07') { cycleFocus(); paint(); return; } // Ctrl+G — cycle tree/edit/term focus
   if (key === '\x14') { // Ctrl+T
     termOpen = !termOpen;
     focus = termOpen ? 'term' : 'edit';
@@ -1509,7 +1797,7 @@ function onKey(key: string): void {
   }
   if (vim === 'search') {
     if (key === '\x1b') vim = 'normal';
-    else if (key === '\r') { vim = 'normal'; if (matches.length) jumpMatch(); }
+    else if (key === '\r') { vim = 'normal'; if (matches.length) { if (!visual) pushJump(); jumpMatch(); } }
     else if (key === '\x7f' || key === '\x08') { searchBuf = searchBuf.slice(0, -1); doSearch(searchBuf); }
     else if (key.length === 1 && key >= ' ') { searchBuf += key; doSearch(searchBuf); }
     paint();
@@ -1585,16 +1873,16 @@ function onKey(key: string): void {
   // focus === 'edit'
   if (vim === 'insert') {
     cmpState = (key === '\x0e' || key === '\x10') ? cmpState : null;
-    if (key === '\x1b') { vim = 'normal'; clampCur(); }
+    if (key === '\x1b') { vim = 'normal'; clampCur(); insEnd(); }
     else if (key === '\x0e' || key === '\x10') completeWord(key === '\x0e' ? 1 : -1);
-    else if (key === '\r') { recordKey('\n'); newline(); }
-    else if (key === '\x7f' || key === '\x08') { recordKey('\b'); backspace(); }
+    else if (key === '\r') { recordKey('\n'); insPush('\r'); newline(); }
+    else if (key === '\x7f' || key === '\x08') { recordKey('\b'); insPush('\x7f'); backspace(); }
     else if (key === '\x13') saveFile();
-    else if (key === 'UP') { buf.cy = Math.max(0, buf.cy - 1); clampCur(); }
-    else if (key === 'DOWN') { buf.cy = Math.min(buf.lines.length - 1, buf.cy + 1); clampCur(); }
-    else if (key === 'LEFT') { buf.cx = Math.max(0, buf.cx - 1); }
-    else if (key === 'RIGHT') { buf.cx = Math.min(curLine().length, buf.cx + 1); }
-    else if (key.length === 1 && key >= ' ') insertText(key);
+    else if (key === 'UP') { insPush(key); buf.cy = Math.max(0, buf.cy - 1); clampCur(); }
+    else if (key === 'DOWN') { insPush(key); buf.cy = Math.min(buf.lines.length - 1, buf.cy + 1); clampCur(); }
+    else if (key === 'LEFT') { insPush(key); buf.cx = Math.max(0, buf.cx - 1); }
+    else if (key === 'RIGHT') { insPush(key); buf.cx = Math.min(curLine().length, buf.cx + 1); }
+    else if (key.length === 1 && key >= ' ') { insPush(key); insertText(key); }
     paint();
     return;
   }
@@ -1689,6 +1977,7 @@ function feed(data: Buffer): void {
   const flushInsert = () => {
     if (pendingInsert) {
       recordKey(pendingInsert);
+      if (insEntry && !replayingDot) for (const ch of pendingInsert) insChars.push(ch);
       for (const ch of pendingInsert) insertText(ch);
       pendingInsert = '';
       paint();
@@ -1879,7 +2168,7 @@ export function startEditor(filePath?: string): void {
         say(`New file ${path.basename(resolved)}`);
       }
     } else {
-      say('Tab switches pane · :term shell · :help keys · :q quit');
+      say('Tab jump forward · Ctrl+G panes · :term shell · :help keys · :q quit');
     }
     resetBufStateKeepFile();
   } catch (e) {

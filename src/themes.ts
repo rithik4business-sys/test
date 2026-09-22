@@ -1,7 +1,8 @@
 /* TypeWriter theme set — copied from opencode source repo (sst/opencode).
  * Source: packages/tui/src/theme/assets/*.json (dark variant).
  * File basenames are kept verbatim so `:theme <name>` / theme list
- * matches opencode exactly.
+ * matches opencode exactly. 'vim' is a TypeWriter original
+ * based on Vim's default dark colorscheme.
  */
 
 export interface TypeWriterTheme {
@@ -48,6 +49,7 @@ export const THEMES: Record<string, TypeWriterTheme> = {
   'tokyonight': { bg: '#1a1b26', panel: '#1e2030', element: '#222436', border: '#737aa2', borderActive: '#9099b2', borderSubtle: '#545c7e', text: '#c8d3f5', muted: '#828bb8', primary: '#82aaff', primaryText: '#1a1b26', secondary: '#c099ff', accent: '#ff966c', red: '#ff757f', orange: '#ff966c', green: '#c3e88d', cyan: '#82aaff', yellow: '#ffc777', synK: '#c099ff', synS: '#c3e88d', synN: '#ff966c', synF: '#82aaff', synV: '#ff757f', synT: '#ffc777', synO: '#86e1fc', synC: '#828bb8', synP: '#c8d3f5', sel: 'rgba(130,170,255,.35)', caret: '#82aaff' },
   'vercel': { bg: '#000000', panel: '#1a1a1a', element: '#292929', border: '#1f1f1f', borderActive: '#454545', borderSubtle: '#1a1a1a', text: '#ededed', muted: '#878787', primary: '#0070f3', primaryText: '#000000', secondary: '#52a8ff', accent: '#8e4ec6', red: '#e5484d', orange: '#ffb224', green: '#46a758', cyan: '#52a8ff', yellow: '#0ac7ac', synK: '#f75590', synS: '#63c46d', synN: '#f2a700', synF: '#bf7af0', synV: '#52a8ff', synT: '#0ac7ac', synO: '#f75590', synC: '#878787', synP: '#ededed', sel: 'rgba(0,112,243,.35)', caret: '#0070f3' },
   'vesper': { bg: '#101010', panel: '#101010', element: '#101010', border: '#282828', borderActive: '#ffc799', borderSubtle: '#1c1c1c', text: '#ffffff', muted: '#a0a0a0', primary: '#ffc799', primaryText: '#101010', secondary: '#99ffe4', accent: '#ffc799', red: '#ff8080', orange: '#ffc799', green: '#99ffe4', cyan: '#ffc799', yellow: '#ffc799', synK: '#a0a0a0', synS: '#99ffe4', synN: '#ffc799', synF: '#ffc799', synV: '#ffffff', synT: '#ffc799', synO: '#a0a0a0', synC: '#8b8b8b', synP: '#ffffff', sel: 'rgba(255,199,153,.35)', caret: '#ffc799' },
+  'vim': { bg: '#000000', panel: '#0d0d0d', element: '#1c1c1c', border: '#3a3a3a', borderActive: '#ffff60', borderSubtle: '#222222', text: '#d0d0d0', muted: '#7f7f7f', primary: '#ffff60', primaryText: '#000000', secondary: '#40ffff', accent: '#ff80ff', red: '#ff0000', orange: '#ffa500', green: '#00ff00', cyan: '#00ffff', yellow: '#ffff00', synK: '#ffff60', synS: '#ffa0a0', synN: '#ff80ff', synF: '#40ffff', synV: '#40ffff', synT: '#60ff60', synO: '#ffa500', synC: '#80a0ff', synP: '#d0d0d0', sel: 'rgba(255,255,96,.35)', caret: '#ffff60' },
   'zenburn': { bg: '#3f3f3f', panel: '#4f4f4f', element: '#5f5f5f', border: '#5f5f5f', borderActive: '#8cd0d3', borderSubtle: '#4f4f4f', text: '#dcdccc', muted: '#9f9f9f', primary: '#8cd0d3', primaryText: '#3f3f3f', secondary: '#dc8cc3', accent: '#93e0e3', red: '#cc9393', orange: '#f0dfaf', green: '#7f9f7f', cyan: '#dfaf8f', yellow: '#93e0e3', synK: '#f0dfaf', synS: '#cc9393', synN: '#8fb28f', synF: '#8cd0d3', synV: '#dcdccc', synT: '#93e0e3', synO: '#f0dfaf', synC: '#7f9f7f', synP: '#dcdccc', sel: 'rgba(140,208,211,.35)', caret: '#8cd0d3' },
 };
 
@@ -59,7 +61,7 @@ export const THEME_NAMES: string[] = [
   'flexoki', 'github', 'gruvbox', 'kanagawa', 'lucent-orng', 'material',
   'matrix', 'mercury', 'monokai', 'nightowl', 'nord', 'one-dark', 'orng',
   'osaka-jade', 'palenight', 'rosepine', 'solarized', 'synthwave84',
-  'tokyonight', 'vercel', 'vesper', 'zenburn',
+  'tokyonight', 'vercel', 'vesper', 'vim', 'zenburn',
 ];
 
 export const DEFAULT_THEME = 'opencode';

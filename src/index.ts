@@ -54,6 +54,8 @@ function printHelp(): void {
   --status      Show login status
   --push        Push current project to GitHub
   --serve       Start local web preview (port 3000)
+  --port=N      Web preview port (with --serve, default 3000)
+  --host=ADDR   Web preview bind address (default 127.0.0.1)
   --theme <name>  Set editor theme (opencode theme set)
   --themes        List available themes
   --help        Show this help message
@@ -64,6 +66,8 @@ function printHelp(): void {
   typewriter file.ts            Open file.ts
   typewriter --login            Login to GitHub
   typewriter --push             Push project to GitHub
+  typewriter --serve             Web preview on http://127.0.0.1:3000
+  typewriter --serve --port=8080 Web preview on a custom port
   typewriter --themes           List themes
   typewriter --theme nord       Set default theme
 `);

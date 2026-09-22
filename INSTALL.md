@@ -59,6 +59,19 @@ npm run build
 .\typewriter.ps1 --help
 ```
 
+> **First-run block?** Stock Windows sets `ExecutionPolicy` to Restricted,
+> which blocks `.ps1` files. One-time fix (CurrentUser only, no admin):
+> ```powershell
+> Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+> ```
+> Or run without changing policy:
+> ```powershell
+> powershell -ExecutionPolicy Bypass -File .\typewriter.ps1 --help
+> ```
+> Tip: use **Windows Terminal** (ships with Windows 11) for proper Unicode,
+> emoji-free box drawing, and 24-bit color. Optional: add the repo folder to
+> `PATH` (`$env:Path`) so `typewriter.ps1` works from any directory.
+
 ### Using Command Prompt
 ```cmd
 # Clone repository
@@ -164,20 +177,19 @@ npm install -g typescript
 npx tsc
 ```
 
-#### "Permission denied"
+#### "Permission denied" (macOS/Linux only)
 ```bash
-# Make scripts executable (macOS/Linux)
-chmod +x typewriter.ps1
-chmod +x typewriter.bat
+# Windows .ps1/.bat files don't use chmod — on Windows a blocked script
+# means ExecutionPolicy (see Windows section above), not file permissions.
+chmod +x dist/index.js
 ```
 
 #### "Node.js not found"
 ```bash
-# Install Node.js from https://nodejs.org
-# Or use nvm (Node Version Manager)
-curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.0/install.sh | bash
-nvm install 14
-nvm use 14
+# Install Node.js 18+ from https://nodejs.org (check: node --version)
+# Or use nvm (Node Version Manager) / nvm-windows / fnm:
+nvm install 20
+nvm use 20
 ```
 
 #### "GitHub login fails"
@@ -201,6 +213,21 @@ If you encounter issues:
    - Node.js version (`node --version`)
    - Error message
    - Steps to reproduce
+
+## Production notes
+
+- **Lock the web API**: by default the local server accepts unauthenticated
+  requests from your own machine. To require a token (also enables the remote
+  `exec` endpoint safely), set it before serving:
+  ```powershell
+  $env:TYPEWRITER_TOKEN = "a-long-random-string"
+  .\typewriter.ps1 -Serve
+  ```
+  The browser then asks for the token once and remembers it.
+- **Port**: default `3000`; override with `--port=N` (CLI) or `PORT=N`.
+- **Data stays local**: config, GitHub token, undo history, and sessions live
+  in `%USERPROFILE%\.typewriter` (`~/.typewriter` on macOS/Linux) with
+  owner-only permissions.
 
 ## Uninstallation
 

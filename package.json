@@ -12,7 +12,7 @@
     "INSTALL.md"
   ],
   "scripts": {
-    "build": "npx tsc && cp -r assets dist/ 2>/dev/null || true",
+    "build": "npx tsc && node -e \"try{require('fs').cpSync('assets','dist/assets',{recursive:true,force:true})}catch(e){console.error('asset copy failed:',e.message);process.exit(1)}\"",
     "start": "node dist/index.js",
     "dev": "npx tsc && node dist/index.js",
     "serve": "npm run build && node dist/server.js",

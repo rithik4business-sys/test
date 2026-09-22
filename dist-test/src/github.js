@@ -33,11 +33,13 @@ var __importStar = (this && this.__importStar) || (function () {
     };
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.ALLOWED_REPO_PATCH = exports.REPO_NAME_RE = exports.loadToken = void 0;
+exports.GitHubError = exports.ALLOWED_REPO_PATCH = exports.REPO_NAME_RE = exports.loadToken = void 0;
 exports.isValidRepoName = isValidRepoName;
 exports.parseRepoFull = parseRepoFull;
 exports.sanitizeRepoPatch = sanitizeRepoPatch;
 exports.sanitizeTopics = sanitizeTopics;
+exports.gitHubErrorMessage = gitHubErrorMessage;
+exports.isEmptyRepo = isEmptyRepo;
 exports.authenticate = authenticate;
 exports.getUser = getUser;
 exports.getAuthenticatedUser = getAuthenticatedUser;
@@ -112,7 +114,10 @@ function sanitizeRepoPatch(input) {
         else if (k === 'description' || k === 'homepage' || k === 'default_branch') {
             if (v === null)
                 out[k] = null;
-            else if (typeof v === 'string' && v.length <= 350)
+            // Empty strings are dropped, not sent: GitHub 422s on
+            // description:"" and default_branch:"" (the latter is what an empty
+            // repo's branch-less select produces). Absent = leave unchanged.
+            else if (typeof v === 'string' && v !== '' && v.length <= 350)
                 out[k] = v;
         }
         else if (typeof v === 'boolean') {
@@ -138,12 +143,24 @@ function sanitizeTopics(input) {
     }
     return out;
 }
+/** Build the message for a failed GitHub API call, including the first
+ * validation detail GitHub returns (errors[0]) — otherwise every 422 shows
+ * up as a bare "Validation Failed" with no hint what to fix. Pure (tested). */
+function gitHubErrorMessage(code, json, raw) {
+    const base = (json && json.message) || String(raw || '').slice(0, 200) || `HTTP ${code}`;
+    const errs = json && Array.isArray(json.errors) ? json.errors : [];
+    const first = errs.length ? errs[0] : null;
+    const detail = first ? String(first.message || first.code || '') : '';
+    const msg = detail && detail !== base ? `${base}: ${detail}` : String(base);
+    return msg.slice(0, 300);
+}
 class GitHubError extends Error {
     constructor(message, statusCode) {
         super(message);
         this.statusCode = statusCode;
     }
 }
+exports.GitHubError = GitHubError;
 const CLIENT_ID = process.env.TYPEWRITER_CLIENT_ID || 'Iv1.b507a08c87ecfe98';
 function requestOnce(options, body) {
     return new Promise((resolve, reject) => {
@@ -187,10 +204,10 @@ function requestOnce(options, body) {
                 }
                 else if (code === 429 || code >= 500) {
                     const ra = parseInt(String(res.headers['retry-after'] || '0'), 10);
-                    fail(Object.assign(new GitHubError(`GitHub API error: ${code} - ${(json && json.message) || data.slice(0, 200)}`, code), { retryable: true, retryAfter: Number.isFinite(ra) ? ra : 0 }));
+                    fail(Object.assign(new GitHubError(gitHubErrorMessage(code, json, data), code), { retryable: true, retryAfter: Number.isFinite(ra) ? ra : 0 }));
                 }
                 else {
-                    fail(new GitHubError(`GitHub API error: ${code} - ${(json && json.message) || data.slice(0, 200)}`, code));
+                    fail(new GitHubError(gitHubErrorMessage(code, json, data), code));
                 }
             });
         });
@@ -229,6 +246,12 @@ async function request(options, body) {
 }
 function isNotFound(e) {
     return e instanceof GitHubError && e.statusCode === 404;
+}
+/** GitHub answers ref/branch reads on an empty repo with 409
+ * "Git Repository is empty." — that means "no branch yet", not failure.
+ * Callers that can initialize (push) or list (branches) handle it as empty. */
+function isEmptyRepo(e) {
+    return e instanceof GitHubError && e.statusCode === 409 && /repository is empty/i.test(e.message || '');
 }
 async function authenticate() {
     const existingToken = (0, utils_1.loadToken)();
@@ -597,7 +620,7 @@ async function getBranch(token, owner, repo) {
                 return { branch, commitSha: ref.object.sha };
         }
         catch (e) {
-            if (!isNotFound(e))
+            if (!isNotFound(e) && !isEmptyRepo(e))
                 throw e;
         }
     }
@@ -651,20 +674,23 @@ async function pushFiles(token, owner, repo, files, message = 'Update from TypeW
         }, JSON.stringify({ sha: commitRes.sha }));
         return branchInfo.branch;
     }
-    // Empty repo: create tree + root commit + new ref
-    const treeRes = await request({
-        hostname: 'api.github.com', path: `/repos/${owner}/${repo}/git/trees`,
-        method: 'POST', headers: apiHeaders(token),
-    }, JSON.stringify({ tree }));
-    const commitRes = await request({
-        hostname: 'api.github.com', path: `/repos/${owner}/${repo}/git/commits`,
-        method: 'POST', headers: apiHeaders(token),
-    }, JSON.stringify({ message, tree: treeRes.sha, parents: [] }));
+    // Empty repo: the git-database API refuses EVERYTHING (409 "Git Repository
+    // is empty.") until a commit exists — trees included. Seed the first file
+    // via the contents API (creates `main`), then take the normal path once
+    // for the rest. Bounded to one recursion: the repo is non-empty after.
+    const entries = Array.from(files.entries());
+    const [firstPath, firstContent] = entries[0];
     await request({
-        hostname: 'api.github.com', path: `/repos/${owner}/${repo}/git/refs`,
-        method: 'POST', headers: apiHeaders(token),
-    }, JSON.stringify({ ref: 'refs/heads/main', sha: commitRes.sha }));
-    return 'main';
+        hostname: 'api.github.com',
+        path: `/repos/${owner}/${repo}/contents/${firstPath.split('/').map(encodeURIComponent).join('/')}`,
+        method: 'PUT', headers: apiHeaders(token),
+    }, JSON.stringify({
+        message, branch: 'main',
+        content: Buffer.from(firstContent, 'utf-8').toString('base64'),
+    }));
+    if (entries.length === 1)
+        return 'main';
+    return pushFiles(token, owner, repo, new Map(entries.slice(1)), message);
 }
 async function getRepos(token, opts) {
     const per = Math.max(1, Math.min(100, opts?.per_page ?? 30));
