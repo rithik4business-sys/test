@@ -89,8 +89,11 @@ const LANG_KEYWORDS: Record<string, string[]> = {
   markdown: [],
 };
 
-// Pre-built keyword Sets per language for O(1) lookup
-const LANG_KW_SETS: Record<string, Set<string>> = {};
+// Pre-built keyword Sets per language for O(1) lookup.
+// Null prototype: a plain `{}` would leak Object.prototype members, so an
+// unknown language like 'constructor'/'toString' resolved to a truthy
+// function and crashed the `.has` lookup below.
+const LANG_KW_SETS = Object.create(null) as Record<string, Set<string>>;
 for (const lang of Object.keys(LANG_KEYWORDS)) {
   LANG_KW_SETS[lang] = new Set(LANG_KEYWORDS[lang]);
 }
@@ -123,8 +126,10 @@ function isWordCharCode(c: number): boolean {
   return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 45;
 }
 
-// Sticky CSS property regex — no per-char slice
-const RE_CSS_PROP_Y = /^([a-z-]+)(?=\s*:)/y;
+// Sticky CSS property regex — no per-char slice. `y` already anchors the match
+// at lastIndex; a leading `^` would additionally require index 0, so property
+// detection only ever worked in column 0.
+const RE_CSS_PROP_Y = /([a-z-]+)(?=\s*:)/y;
 
 function scanNumber(line: string, i: number): number {
   const n = line.length;

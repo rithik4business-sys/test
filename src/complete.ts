@@ -29,20 +29,32 @@ export interface Completion {
 const MAX_SCAN_LINES = 400;
 const MAX_SUGGEST_LEN = 100;
 
+// Hoisted patterns: these run on every keystroke; a regex literal allocates a
+// fresh RegExp object on each evaluation (same convention as highlight.ts).
+const RE_WORD = /[A-Za-z_$][A-Za-z0-9_$]*/g;
+const RE_WORD_CH = /[A-Za-z0-9_$]/;
+const RE_NONSPACE = /\S/;
+const RE_LAST_WORD = /([A-Za-z_$][A-Za-z0-9_$]*)$/;
+const RE_TRAILING_OPENER = /\s*([{[(])\s*$/;
+
 export function tokenizeWords(s: string): string[] {
-  const m = String(s).match(/[A-Za-z_$][A-Za-z0-9_$]*/g);
+  // RE_WORD is /g, and String.prototype.match resets a global regex's
+  // lastIndex before collecting, so hoisting is stateless here.
+  const m = String(s).match(RE_WORD);
   return m || [];
 }
 
 /** Most recent earlier line that starts with `prefix`, minus the prefix. */
 function recentSuffix(prefix: string, lines: string[]): string | null {
-  if (!prefix || !/\S/.test(prefix) || prefix.trim().length < 2) return null;
-  if (prefix.length > 200) prefix = prefix.slice(-200);
+  if (!prefix || !RE_NONSPACE.test(prefix) || prefix.trim().length < 2) return null;
+  // Match against the FULL prefix: truncating it makes startsWith() and
+  // slice() disagree — a line matching only the tail would yield a suffix
+  // that duplicates characters when appended after the full prefix.
   for (let i = lines.length - 1; i >= 0; i--) {
     const l = lines[i];
     if (l.length > prefix.length && l.startsWith(prefix)) {
       const suf = l.slice(prefix.length);
-      if (suf && /\S/.test(suf)) return suf.slice(0, MAX_SUGGEST_LEN);
+      if (suf && RE_NONSPACE.test(suf)) return suf.slice(0, MAX_SUGGEST_LEN);
     }
   }
   return null;
@@ -86,9 +98,23 @@ function snippetFor(trigger: string, lang: string): string | null {
 
 /** Snippet trigger = last word of the prefix, caret glued to its end. */
 function snippetSuffix(prefix: string, lang: string): string | null {
-  const m = prefix.match(/([A-Za-z_$][A-Za-z0-9_$]*)$/);
+  const m = prefix.match(RE_LAST_WORD);
   if (!m) return null;
   return snippetFor(m[1], lang || 'text');
+}
+
+/** First index of `w` in `s` at a word boundary at or after `from`.
+ *  `whole` additionally requires a boundary after the match, so complete
+ *  tokens can't match inside a longer word ('foo' in 'foobar'). */
+function indexOfWord(s: string, w: string, from: number, whole: boolean): number {
+  let i = s.indexOf(w, from);
+  while (i !== -1) {
+    const before = i === 0 || !RE_WORD_CH.test(s[i - 1]);
+    const after = !whole || i + w.length === s.length || !RE_WORD_CH.test(s[i + w.length]);
+    if (before && after) return i;
+    i = s.indexOf(w, i + 1);
+  }
+  return -1;
 }
 
 /** Token co-occurrence: most recent line containing the trailing word
@@ -100,12 +126,14 @@ function ngramSuffix(prefix: string, lines: string[]): string | null {
   for (let i = lines.length - 1; i >= 0; i--) {
     const l = lines[i];
     if (l === prefix || l.length > 300) continue;
-    const ia = l.indexOf(a);
+    // `a` is a complete token (both boundaries); `b` may be a partial word
+    // still being typed, so only its start must sit on a boundary.
+    const ia = indexOfWord(l, a, 0, true);
     if (ia === -1) continue;
-    const ib = l.indexOf(b, ia + a.length);
+    const ib = indexOfWord(l, b, ia + a.length, false);
     if (ib === -1) continue;
     const suf = l.slice(ib + b.length);
-    if (suf && /\S/.test(suf)) return suf.slice(0, MAX_SUGGEST_LEN);
+    if (suf && RE_NONSPACE.test(suf)) return suf.slice(0, MAX_SUGGEST_LEN);
   }
   return null;
 }
@@ -115,7 +143,7 @@ const CLOSERS: Record<string, string> = { '{': '}', '[': ']', '(': ')' };
 /** Unclosed opener as the last typed char with nothing after the caret. */
 function bracketSuffix(prefix: string, after: string): string | null {
   if (after.trim()) return null;
-  const m = prefix.match(/\s*([{[(])\s*$/);
+  const m = prefix.match(RE_TRAILING_OPENER);
   if (!m) return null;
   return CLOSERS[m[1]] || null;
 }

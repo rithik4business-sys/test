@@ -136,9 +136,12 @@ function requestOnce(options: https.RequestOptions, body?: string): Promise<{ js
     }
     if (!headers['User-Agent']) headers['User-Agent'] = 'TypeWriter-Editor';
     const req = https.request(options, (res) => {
-      let data = '';
-      res.on('data', (chunk) => data += chunk);
+      const chunks: Buffer[] = [];
+      res.on('data', (chunk: Buffer) => chunks.push(chunk));
       res.on('end', () => {
+        // Accumulate raw bytes: `data += chunk` decodes each TCP chunk on its
+        // own and corrupts multi-byte UTF-8 characters split across chunks.
+        const data = Buffer.concat(chunks).toString('utf-8');
         const code = res.statusCode || 0;
         let json: any = {};
         if (data) {
@@ -152,7 +155,10 @@ function requestOnce(options: https.RequestOptions, body?: string): Promise<{ js
         if (code >= 200 && code < 300) {
           // Device-flow polls return 200 with { error } — let caller decide
           ok({ json, retryAfter: 0 });
-        } else if (code === 429 || code >= 500) {
+        } else if (code === 429 || code >= 500 || (code === 403 && !!res.headers['retry-after'])) {
+          // GitHub secondary rate limits answer 403 *or* 429 with a
+          // Retry-After header, so honor it on the 403 form too. Permission
+          // 403s carry no Retry-After and stay terminal.
           const ra = parseInt(String(res.headers['retry-after'] || '0'), 10);
           fail(Object.assign(
             new GitHubError(gitHubErrorMessage(code, json, data), code),
@@ -211,7 +217,12 @@ export async function authenticate(): Promise<string> {
       const user = await getUser(existingToken);
       setGitHubUsername(user.login);
       return existingToken;
-    } catch {
+    } catch (e) {
+      // Only an explicit 401 invalidates the stored credential (state
+      // machine: "logout / token-expired (401)"). A timeout, 5xx or rate
+      // limit must never wipe a token that is still valid — rethrow so the
+      // caller sees the real reason instead of a silent logout.
+      if (!(e instanceof GitHubError) || e.statusCode !== 401) throw e;
       clearToken();
     }
   }
@@ -411,10 +422,13 @@ export async function getTokenScopes(token: string): Promise<{ login: string; na
         'User-Agent': 'TypeWriter-Editor',
       },
     }, (res) => {
-      let data = '';
-      res.on('data', (c) => data += c);
+      const chunks: Buffer[] = [];
+      res.on('data', (c: Buffer) => chunks.push(c));
       res.on('end', () => {
         if (settled) return; settled = true;
+        // Byte accumulation (not `data += c`) so multi-byte UTF-8 characters
+        // split across TCP chunks decode correctly.
+        const data = Buffer.concat(chunks).toString('utf-8');
         const code = res.statusCode || 0;
         if (code === 401) { reject(new GitHubError('Session expired — please log in again', 401)); return; }
         if (code < 200 || code >= 300) {
@@ -556,11 +570,22 @@ const apiHeaders = (token: string) => ({
 });
 
 async function getBranch(token: string, owner: string, repo: string): Promise<{ branch: string; commitSha: string } | null> {
-  for (const branch of ['main', 'master']) {
+  // Resolve the repository's default branch first: the push must land on it
+  // even when it is neither `main` nor `master` (renamed/develop/trunk
+  // defaults). `main`/`master` below remain as fallbacks for empty repos and
+  // odd-shaped responses; getRepo returns null on 404, which preserves the
+  // previous empty/missing-repo behavior exactly.
+  const info = await getRepo(token, owner, repo);
+  const names: string[] = [];
+  if (info && typeof info.default_branch === 'string' && info.default_branch) {
+    names.push(info.default_branch);
+  }
+  for (const b of ['main', 'master']) if (!names.includes(b)) names.push(b);
+  for (const branch of names) {
     try {
       const ref = await request({
         hostname: 'api.github.com',
-        path: `/repos/${owner}/${repo}/git/refs/heads/${branch}`,
+        path: `/repos/${owner}/${repo}/git/refs/heads/${branch.split('/').map(encodeURIComponent).join('/')}`,
         method: 'GET',
         headers: apiGetHeaders(token),
       });
@@ -617,7 +642,7 @@ export async function pushFiles(
       method: 'POST', headers: apiHeaders(token),
     }, JSON.stringify({ message, tree: treeSha, parents: [branchInfo.commitSha] }));
     await request({
-      hostname: 'api.github.com', path: `/repos/${owner}/${repo}/git/refs/heads/${branchInfo.branch}`,
+      hostname: 'api.github.com', path: `/repos/${owner}/${repo}/git/refs/heads/${branchInfo.branch.split('/').map(encodeURIComponent).join('/')}`,
       method: 'PATCH', headers: apiHeaders(token),
     }, JSON.stringify({ sha: commitRes.sha }));
     return branchInfo.branch;

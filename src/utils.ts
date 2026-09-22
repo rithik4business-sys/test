@@ -309,7 +309,9 @@ const EXT_MAP: Record<string, string> = {
 };
 
 export function getLanguageFromExt(ext: string): string {
-  return EXT_MAP[ext] || 'text';
+  // Own-property check: `EXT_MAP['constructor']`/`['toString']` would otherwise
+  // return inherited Object.prototype functions instead of a language string.
+  return Object.prototype.hasOwnProperty.call(EXT_MAP, ext) ? EXT_MAP[ext] : 'text';
 }
 
 export function getGitHubUsername(): string | null {

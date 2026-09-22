@@ -11,12 +11,24 @@ import { ensureConfigDir, getVersion, isBinaryFile } from './utils';
 function ask(question: string): Promise<string> {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   return new Promise((resolve, reject) => {
+    let done = false;
     const onSigint = () => {
+      done = true;
       rl.close();
       reject(new Error('aborted'));
     };
     process.once('SIGINT', onSigint);
+    // stdin EOF (e.g. `< /dev/null`) closes rl before any answer arrives;
+    // without this the promise never settles and main() never completes.
+    rl.on('close', () => {
+      if (done) return;
+      done = true;
+      process.removeListener('SIGINT', onSigint);
+      reject(new Error('aborted'));
+    });
     rl.question(question, (answer) => {
+      if (done) return;
+      done = true;
       process.removeListener('SIGINT', onSigint);
       rl.close();
       resolve(answer.trim());
@@ -149,6 +161,20 @@ async function main(): Promise<void> {
     console.log(`typewriter v${getVersion()}`);
     return;
   }
+  const KNOWN_OPTS = new Set(['-h', '--help', '-v', '--version', '--login', '--logout', '--status', '--push', '--serve', '--themes', '--list-themes', '--theme']);
+  const unknownOpt = args.find(a => a.startsWith('-') && !KNOWN_OPTS.has(a) && !a.startsWith('--port=') && !a.startsWith('--host=') && !a.startsWith('--theme='));
+  if (unknownOpt) {
+    console.error(`\nUnknown option: ${unknownOpt}\n`);
+    console.log('Run typewriter --help for usage.\n');
+    process.exitCode = 1;
+    return;
+  }
+  if (!args.includes('--serve') && args.some(a => a.startsWith('--port=') || a.startsWith('--host='))) {
+    console.error('\n--port/--host require --serve\n');
+    console.log('Run typewriter --help for usage.\n');
+    process.exitCode = 1;
+    return;
+  }
   if (args.includes('--login')) {
     printBanner();
     await loginToGitHub();
@@ -176,7 +202,12 @@ async function main(): Promise<void> {
     const hostArg = args.find(a => a.startsWith('--host='));
     const port = portArg ? parseInt(portArg.split('=')[1], 10) : 3000;
     const host = hostArg ? hostArg.split('=')[1] : (process.env.HOST || '127.0.0.1');
-    await startServer(Number.isFinite(port) ? port : 3000, host);
+    if (!Number.isInteger(port) || port < 0 || port > 65535) {
+      console.error(`\nInvalid port: ${portArg ? portArg.slice('--port='.length) : ''} (expected 0-65535)\n`);
+      process.exitCode = 1;
+      return;
+    }
+    await startServer(port, host);
     return;
   }
   if (args.includes('--themes') || args.includes('--list-themes')) {
@@ -192,9 +223,10 @@ async function main(): Promise<void> {
     const { isThemeName, THEME_NAMES } = await import('./themes');
     const { loadConfig, saveConfig } = await import('./utils');
     if (!name || name.startsWith('-') || !isThemeName(name)) {
-      console.error(name ? `\nUnknown theme: ${name}\n` : '\nMissing value: --theme <name>\n');
+      console.error(name && !name.startsWith('-') ? `\nUnknown theme: ${name}\n` : '\nMissing value: --theme <name>\n');
       console.log('Available themes:\n  ' + THEME_NAMES.join(', ') + '\n');
-      process.exit(1);
+      process.exitCode = 1;
+      return;
     }
     const cfg = loadConfig();
     cfg.theme = name;

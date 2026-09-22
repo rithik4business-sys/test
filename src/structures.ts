@@ -206,6 +206,9 @@ export class CappedBuffer {
   readonly maxBytes: number;
 
   constructor(maxBytes = 131072) {
+    if (!Number.isFinite(maxBytes) || maxBytes < 1) {
+      throw new Error('CappedBuffer maxBytes must be >= 1');
+    }
     this.maxBytes = Math.max(1024, Math.floor(maxBytes));
   }
 

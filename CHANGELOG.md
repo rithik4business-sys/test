@@ -112,6 +112,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `:new`: New file
 - `:help`: Show commands
 
+## [1.3.0]
+
+> Dates for 1.1.0–1.3.0 were not recorded at release time; the repository gained
+> version control after these releases. Content below is derived from the shipped
+> feature documentation in docs/USAGE.md.
+
+### Added
+
+- **True PTY terminals (web)**: xterm.js + node-pty over WebSocket — fullscreen
+  apps, 256 colors, resize sync, per-tab scrollback; graceful exec fallback
+- **LSP bridge**: hover (`K`), go-to-definition (`gd`), completion merge
+  (`Ctrl+Space`) via typescript-language-server, pyright, gopls, rust-analyzer
+- **AI agent tabs**: Claude Code / OpenCode / Codex detection, one-click install
+  with streamed log, launch as named PTY tabs (token-gated install endpoint)
+- GitHub **Settings → Account** in the web UI: device flow with code + timer +
+  backoff, PAT validation with scope enforcement, repo list/create/settings,
+  push review with per-file diffs, 401 auto-logout
+- Windows-safe exec layer (`winsh.sh` quoting, `taskkill` tree kill, PS runners)
+- TS test suite (36 tests) alongside the JS suite (97 tests)
+
+## [1.2.0]
+
+### Added
+
+- Vim grammar parity across both UIs: counts, operators, text objects,
+  visual mode, macros, marks, jumplist, dot-repeat
+- TUI buffers + splits (`:ls :bn :bp :bd :sp :only`)
+- Code runner (`:run`, ▶, `Ctrl+Enter`) for node/python3/bash/go/ruby/php/pwsh
+- Persistent undo (web: localStorage per file, capped; TUI: `~/.typewriter/undo/`)
+
+## [1.1.0]
+
+### Added
+
+- Web tabs (`:bn :bp :bd`, `Ctrl+PgUp/PgDn`), per-tab undo/redo, replace bar +
+  `:s/old/new/g`, keyboard file tree, quick-open fuzzy finder (`Ctrl+P`),
+  terminal conveniences (aliases, `tree`, ghost hints, sticky `cd`),
+  `TYPEWRITER_TOKEN` Bearer auth on all `/api/*` routes
+
 ## [Unreleased]
 
 ### Planned

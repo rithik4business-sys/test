@@ -7,7 +7,7 @@ const SECRET_FILES = new Set(['.env', '.npmrc']);
 const SECRET_EXTS = new Set(['.pem', '.key']);
 const MAX_FILE_BYTES = 900 * 1024;
 
-interface GitRule { neg: boolean; dirOnly: boolean; base: string }
+interface GitRule { neg: boolean; dirOnly: boolean; anchored: boolean; base: string }
 
 function parseGitignore(dir: string): GitRule[] {
   const rules: GitRule[] = [];
@@ -23,19 +23,33 @@ function parseGitignore(dir: string): GitRule[] {
     let neg = false;
     if (line.startsWith('!')) { neg = true; line = line.slice(1).trim(); }
     if (!line) continue;
-    if (line.startsWith('/')) line = line.slice(1);
+    // A leading slash anchors the pattern to the root; remember it, because
+    // stripping it would otherwise make `/dist/` match at every depth.
+    let anchored = false;
+    if (line.startsWith('/')) { anchored = true; line = line.slice(1); }
     let dirOnly = false;
     if (line.endsWith('/')) { dirOnly = true; line = line.slice(0, -1); }
     if (!line || line.includes('**')) continue;
-    rules.push({ neg, dirOnly, base: line });
+    rules.push({ neg, dirOnly, anchored, base: line });
   }
   return rules;
 }
 
 function ruleHits(rule: GitRule, rel: string, isDir: boolean): boolean {
   const base = rule.base;
-  if (base.includes('/')) {
-    return rel === base || rel.startsWith(base + '/');
+  // Root-anchored patterns (leading `/` or an inner slash) match only from
+  // the root down, per gitignore(5); dirOnly patterns match directories only.
+  if (rule.anchored || base.includes('/')) {
+    let m = rel === base || rel.startsWith(base + '/');
+    if (!m && rule.anchored && !base.includes('/') && base.startsWith('*.') && base.indexOf('*', 1) === -1) {
+      // root-level extension glob, e.g. `/*.log`
+      const suf = base.slice(1);
+      const seg = rel.split('/');
+      const name = seg[seg.length - 1];
+      m = seg.length === 1 && name.endsWith(suf) && name !== suf.slice(1);
+    }
+    if (!m) return false;
+    return rule.dirOnly ? isDir : true;
   }
   const parts = rel.split('/');
   const name = parts[parts.length - 1];
@@ -88,6 +102,9 @@ export function collectProjectFiles(dir: string, baseDir?: string, depth = 0): M
         } else if (IGNORE_DIRS.has(entry.name)) continue;
         walk(fullPath, dep + 1);
       } else {
+        // Only regular files: readFileSync on a FIFO blocks until a writer
+        // appears, which would freeze the editor's event loop forever.
+        if (!entry.isFile()) continue;
         if (IGNORE_EXACT.has(entry.name) || entry.name.toLowerCase().endsWith('.log')) continue;
         if (SECRET_FILES.has(entry.name)) continue;
         if (entry.name === '.env.example') { /* allowed */ }
@@ -97,6 +114,11 @@ export function collectProjectFiles(dir: string, baseDir?: string, depth = 0): M
         if (dot >= 0 && SECRET_EXTS.has(low.slice(dot))) continue;
         if (gitIgnored(rules, rel, false)) continue;
         try {
+          // Size-gate BEFORE reading: readFileSync allocates the whole file
+          // in memory, so a multi-GB media file would be loaded in full only
+          // to be discarded. Keep the post-read check for files that grow
+          // between stat and read.
+          if (fs.statSync(fullPath).size > MAX_FILE_BYTES) continue;
           const raw = fs.readFileSync(fullPath);
           if (raw.length > MAX_FILE_BYTES) continue;
           if (raw.slice(0, 8192).includes(0)) continue;

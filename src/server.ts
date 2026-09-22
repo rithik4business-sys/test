@@ -60,7 +60,11 @@ const AGENTS: Record<string, AgentSpec> = {
   },
 };
 export function findAgentBin(id: string): string | null {
-  const spec = AGENTS[id];
+  // Own-property guard: prototype members ('constructor', '__proto__', ...) are
+  // truthy on a plain object and used to crash below — AGENTS[id].extraPaths is
+  // undefined there, so `for (const rel of spec.extraPaths)` threw a TypeError
+  // out of this exported function instead of returning null.
+  const spec = Object.prototype.hasOwnProperty.call(AGENTS, id) ? AGENTS[id] : undefined;
   if (!spec) return null;
   try {
     const r = spawnSync('sh', ['-c', `command -v ${spec.bin}`], { timeout: 5000, encoding: 'utf-8' });
@@ -78,8 +82,16 @@ export function findAgentBin(id: string): string | null {
   return null;
 }
 export interface AgentStatus { id: string; name: string; installed: boolean; bin?: string; version?: string; run: string; installLabel: string }
+/** Fresh scans run up to six spawnSync probes (command -v + --version per
+ *  agent) with 5s/10s timeouts — blocking the event loop inside the HTTP
+ *  handler on every request. Memoize so a polling UI pays it at most once
+ *  per window. */
+const AGENT_STATUS_TTL = 5000;
+let _agentCache: { at: number; list: AgentStatus[] } | null = null;
 export function agentStatus(): AgentStatus[] {
-  return Object.keys(AGENTS).map((id) => {
+  const now = Date.now();
+  if (_agentCache && now - _agentCache.at < AGENT_STATUS_TTL) return _agentCache.list;
+  const list = Object.keys(AGENTS).map((id) => {
     const spec = AGENTS[id];
     const bin = findAgentBin(id);
     const st: AgentStatus = { id, name: spec.name, installed: bin !== null, run: spec.run, installLabel: spec.installLabel };
@@ -93,11 +105,16 @@ export function agentStatus(): AgentStatus[] {
     }
     return st;
   });
+  _agentCache = { at: now, list };
+  return list;
 }
 interface InstallJob { id: string; running: boolean; exitCode: number | null; log: CappedBuffer }
 let installJob: InstallJob | null = null;
 function startInstall(id: string): { started: boolean; error?: string } {
-  const spec = AGENTS[id];
+  // Same own-property guard as findAgentBin: POST /api/agents/install with
+  // id='constructor'/'__proto__' used to pass `!spec` and surface as a 500
+  // (TypeError inside findAgentBin) instead of the intended 400.
+  const spec = Object.prototype.hasOwnProperty.call(AGENTS, id) ? AGENTS[id] : undefined;
   if (!spec) return { started: false, error: 'unknown agent' };
   if (findAgentBin(id)) return { started: false, error: 'already installed' };
   if (installJob && installJob.running) return { started: false, error: 'another install is already running' };
@@ -200,7 +217,7 @@ const LSP_INSTALL_HINT: Record<string, string> = {
   go: 'go install golang.org/x/tools/gopls@latest',
   rust: 'rustup component add rust-analyzer',
 };
-interface LspSession { proc: any; buf: string; pending: Map<number, any>; seq: number; open: Map<string, number>; inited: boolean; ws: any }
+interface LspSession { proc: any; buf: Buffer; pending: Map<number, any>; seq: number; open: Map<string, number>; inited: boolean; ws: any }
 function lspSend(s: LspSession, msg: any): void {
   const body = Buffer.from(JSON.stringify(msg), 'utf-8');
   try { s.proc.stdin.write(Buffer.concat([Buffer.from(`Content-Length: ${body.length}\r\n\r\n`, 'utf-8'), body])); } catch {}
@@ -212,7 +229,12 @@ const MAX_LSP = 4;
 let activeLsp = 0;
 function lspAccept(ws: any, url: URL): void {
   const lang = (url.searchParams.get('lang') || '').toLowerCase();
-  const spec = LSP_SERVERS[lang];
+  // Own-property guard: `lang` is attacker-controlled query input, and
+  // `LSP_SERVERS['constructor']` (etc.) is truthy on a plain object — the old
+  // lookup skipped the `unsupported language` rejection below and fell into
+  // spawn(undefined, …), answering a misleading `no-server` (plus an
+  // undefined install hint) instead of the real400-style error.
+  const spec = Object.prototype.hasOwnProperty.call(LSP_SERVERS, lang) ? LSP_SERVERS[lang] : undefined;
   const send = (o: any) => { try { ws.send(JSON.stringify(o)); } catch {} };
   if (!spec) { send({ t: 'error', error: 'unsupported language: ' + lang }); try { ws.close(); } catch {} return; }
   if (activeLsp >= MAX_LSP) { try { ws.close(1013, 'busy'); } catch {} return; }
@@ -228,7 +250,7 @@ function lspAccept(ws: any, url: URL): void {
     try { ws.close(); } catch {}
     return;
   }
-  const sess: LspSession = { proc, buf: '', pending: new Map(), seq: 0, open: new Map(), inited: false, ws };
+  const sess: LspSession = { proc, buf: Buffer.alloc(0), pending: new Map(), seq: 0, open: new Map(), inited: false, ws };
   let exited = false;
   const fail = () => {
     if (exited) return; exited = true;
@@ -238,16 +260,25 @@ function lspAccept(ws: any, url: URL): void {
   proc.on('error', fail);
   proc.on('exit', () => { if (!exited) { exited = true; try { ws.close(); } catch {} } });
   proc.stdout?.on('data', (d: any) => {
-    sess.buf += String(d);
+    // LSP base protocol counts Content-Length in BYTES and permits a second
+    // header (Content-Type) after it. The old decoded-string buffer violated
+    // both: String(chunk) mangles multi-byte chars split across chunks,
+    // string.length (UTF-16 units) < byte length mis-frames any message with
+    // non-ASCII text, and the `Content-Length...\r\n\r\n` pattern never
+    // matched when Content-Type followed (parser stalled until the 1MB trim).
+    const chunk = Buffer.isBuffer(d) ? d : Buffer.from(String(d), 'utf-8');
+    sess.buf = sess.buf.length === 0 ? chunk : Buffer.concat([sess.buf, chunk]);
     if (sess.buf.length > 1048576) sess.buf = sess.buf.slice(-524288);
     for (;;) {
-      const hm = sess.buf.match(/Content-Length:\s*(\d+)\r\n\r\n/);
-      if (!hm) break;
+      const he = sess.buf.indexOf('\r\n\r\n');
+      if (he < 0) break;
+      const hm = /Content-Length:\s*(\d+)/.exec(sess.buf.toString('ascii', 0, he));
+      if (!hm) { sess.buf = sess.buf.slice(he + 4); continue; } // skip junk header block
       const len = parseInt(hm[1], 10);
-      const start = (hm.index ?? 0) + hm[0].length;
+      const start = he + 4;
       if (sess.buf.length < start + len) break;
       let msg: any = null;
-      try { msg = JSON.parse(sess.buf.slice(start, start + len)); } catch { /* fall through */ }
+      try { msg = JSON.parse(sess.buf.slice(start, start + len).toString('utf-8')); } catch { /* fall through */ }
       sess.buf = sess.buf.slice(start + len);
       if (!msg) continue;
       if (msg.id !== undefined && sess.pending.has(msg.id)) {
@@ -353,7 +384,13 @@ function readBody(req: http.IncomingMessage): Promise<string> {
     const parts: Buffer[] = [];
     let bytes = 0;
     let done = false;
-    const fail = (e: Error) => { if (!done) { done = true; reject(e); try { req.destroy(); } catch { /* noop */ } } };
+    // Do NOT destroy the request here: every route that overflows MAX_BODY
+    // answers with an explicit 413, and killing the socket first discards
+    // that response — the client sees a connection reset instead (verified:
+    // respond-after-destroy delivers nothing). With the socket kept alive the
+    // 413 is delivered; further chunks are ignored by the `done` guard and
+    // Node discards the remainder once the response is written.
+    const fail = (e: Error) => { if (!done) { done = true; reject(e); } };
     req.on('data', (c) => {
       if (done) return;
       const buf = Buffer.isBuffer(c) ? c : Buffer.from(String(c), 'utf-8');
@@ -372,9 +409,15 @@ const rateBuckets = new Map<string, number[]>();
 function throttle(req: http.IncomingMessage, scope: string, perMinute: number): boolean {
   let ip = 'local';
   try {
+    const remote = (req.socket && req.socket.remoteAddress) || '';
     const fwd = req.headers['x-forwarded-for'];
-    ip = (Array.isArray(fwd) ? fwd[0] : (fwd || '')).split(',')[0].trim()
-      || (req.socket && req.socket.remoteAddress) || 'local';
+    const xff = (Array.isArray(fwd) ? fwd[0] : (fwd || '')).split(',')[0].trim();
+    // Only trust X-Forwarded-For when the direct peer is loopback (a reverse
+    // proxy on this machine). The header is client-settable on a direct
+    // connection, and `ip` keys the bucket below — an untrusted value let any
+    // client mint unlimited distinct buckets.
+    const trustFwd = remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1';
+    ip = (trustFwd && xff) || remote || 'local';
   } catch { /* keep default */ }
   const key = ip + '|' + scope;
   const now = Date.now();
@@ -389,7 +432,16 @@ function throttle(req: http.IncomingMessage, scope: string, perMinute: number): 
     return false;
   }
   hits.push(now);
-  if (rateBuckets.size > 5000) rateBuckets.clear();
+  if (rateBuckets.size > 5000) {
+    // Evict only windows that have fully expired. The old blanket clear()
+    // reset every client's live window, silently letting them exceed
+    // perMinute for the rest of the hour.
+    for (const [k, hs] of rateBuckets) {
+      while (hs.length > 0 && hs[0] <= windowStart) hs.shift();
+      if (hs.length === 0) rateBuckets.delete(k);
+    }
+    if (rateBuckets.size > 5000) rateBuckets.clear(); // last-resort memory bound
+  }
   rateBuckets.set(key, hits);
   return true;
 }
@@ -404,7 +456,11 @@ function sendJson(res: http.ServerResponse, code: number, obj: any): void {
 }
 
 async function parseJsonBody(req: http.IncomingMessage): Promise<any> {
-  const raw = await readBody(req);
+  // An unreadable body (oversize / client abort) must surface as `null` so the
+  // caller answers 400 — letting readBody's rejection reach the outer catch
+  // turned every oversized upload to these routes into a 500 'Server error'.
+  let raw: string;
+  try { raw = await readBody(req); } catch { return null; }
   try { return JSON.parse(raw || '{}'); } catch { return null; }
 }
 
@@ -511,8 +567,13 @@ let _cachedPagePath: string | null = null;
 let _cachedPageMtime = -1;
 function idePage(): string {
   const candidates = [
-    path.join(process.cwd(), 'public', 'index.html'),
+    // Bundled page first: process.cwd() is the user's opened project (see
+    // index.ts), so the old cwd-first order served an arbitrary project's
+    // public/index.html as the editor UI (a planted page would run at the
+    // editor's origin). cwd remains the fallback when the bundled file is
+    // missing — when developing from the repo root both paths are the same file.
     path.join(__dirname, '..', 'public', 'index.html'),
+    path.join(process.cwd(), 'public', 'index.html'),
   ];
   for (const p of candidates) {
     try {
@@ -644,7 +705,13 @@ export function startServer(port = 3000, host = '127.0.0.1'): Promise<void> {
             'codex.svg': 'image/svg+xml',
             'claude.svg': 'image/svg+xml',
           };
-          const type = ICONS[name];
+          // Own-property guard: a project file named `assets/icons/constructor`
+          // (bases include ROOT/assets/icons — the opened project) makes
+          // `ICONS['constructor']` return the Object constructor, and that
+          // Function reaching writeHead throws ERR_HTTP_INVALID_HEADER_VALUE
+          // → the route's catch answers 404 for a file that exists. Same bug
+          // class as MIME_MAP below (see its comment).
+          const type = Object.prototype.hasOwnProperty.call(ICONS, name) ? ICONS[name] : undefined;
           if (!type || name.includes('..') || name.includes('/')) {
             res.writeHead(404, { 'Content-Type': 'text/plain' });
             res.end('Not found');
@@ -662,7 +729,10 @@ export function startServer(port = 3000, host = '127.0.0.1'): Promise<void> {
               }
               throw new Error('missing');
             });
-            res.writeHead(200, { 'Content-Type': type });
+            // Project-controlled bytes: sandbox the context so a planted SVG
+            // cannot run script at the editor's origin when opened directly
+            // (Content-Security-Policy is not applied to <img> loads).
+            res.writeHead(200, { 'Content-Type': type, 'Content-Security-Policy': 'sandbox' });
             res.end(data);
           } catch {
             res.writeHead(404, { 'Content-Type': 'text/plain' });
@@ -805,7 +875,17 @@ export function startServer(port = 3000, host = '127.0.0.1'): Promise<void> {
             res.end('Not found');
             return;
           }
-          res.writeHead(200, { 'Content-Type': MIME_MAP[ext] || 'application/octet-stream' });
+          // Own-property lookup: a file named `x.constructor` gives
+          // ext='constructor', and the prototype member (a function) reaching
+          // writeHead throws ERR_HTTP_INVALID_HEADER_VALUE -> 500 instead of
+          // serving the file. CSP sandbox: this is arbitrary project content —
+          // an SVG opened directly must not execute script at the editor's
+          // origin (it could read localStorage 'tw-token' and call the API).
+          const mime = Object.prototype.hasOwnProperty.call(MIME_MAP, ext) ? MIME_MAP[ext] : '';
+          res.writeHead(200, {
+            'Content-Type': mime || 'application/octet-stream',
+            'Content-Security-Policy': 'sandbox',
+          });
           res.end(data);
           return;
         }
@@ -896,6 +976,7 @@ export function startServer(port = 3000, host = '127.0.0.1'): Promise<void> {
             cwd = String(j.cwd || '');
           } catch { /* bad json */ }
           if (!cmd.trim() || cmd.length > 2000) {
+            activeExecs--; // release the slot taken above — every exit path must
             res.writeHead(400, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ error: 'bad request' }));
             return;
@@ -904,6 +985,7 @@ export function startServer(port = 3000, host = '127.0.0.1'): Promise<void> {
           if (cwd) {
             const dir = safePath(ROOT, cwd);
             if (!dir) {
+              activeExecs--; // release the slot taken above
               res.writeHead(403, { 'Content-Type': 'application/json' });
               res.end(JSON.stringify({ error: 'forbidden' }));
               return;
@@ -1013,6 +1095,14 @@ export function startServer(port = 3000, host = '127.0.0.1'): Promise<void> {
             res.end(JSON.stringify({ error: 'forbidden' }));
             return;
           }
+          try { fs.lstatSync(fromFp); } catch {
+            // Missing source is a client error, not a server fault: without
+            // this check renameSync throws ENOENT and the caller got 500
+            // 'rename failed' (delete already answers 404 for the same case).
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'not found' }));
+            return;
+          }
           try {
             if (fs.existsSync(toFp)) {
               res.writeHead(409, { 'Content-Type': 'application/json' });
@@ -1033,6 +1123,11 @@ export function startServer(port = 3000, host = '127.0.0.1'): Promise<void> {
         // ---- project search (respects hidden rules + size caps) ----
         if (url.pathname === '/api/search' && req.method === 'POST') {
           if (!needAuth(req, url, res)) return;
+          // Every other expensive route is throttled (exec:941, git-write:1215,
+          // agents-install:757); search alone did a synchronous walk of up to
+          // 2000 files per request with no limit — 1000 parallel POSTs stall
+          // the event loop for seconds each.
+          if (!throttle(req, 'search', 60)) { sendJson(res, 429, { error: 'rate limited, try again shortly' }); return; }
           const body = await parseJsonBody(req);
           if (!body) { sendJson(res, 400, { error: 'invalid json' }); return; }
           const q = typeof body.q === 'string' ? body.q : '';
@@ -1088,6 +1183,11 @@ export function startServer(port = 3000, host = '127.0.0.1'): Promise<void> {
         // ---- local git (status / diff / commit / pull / init) ----
         if ((url.pathname === '/api/git/status' || url.pathname === '/api/git/diff') && req.method === 'GET') {
           if (!needAuth(req, url, res)) return;
+          // Unlike exec (MAX_EXECS=4 at :946) and git-write (:1215), this route
+          // spawned one `git` child per request with no cap or throttle — a
+          // request flood pinned up to N concurrent git processes for the full
+          // 20s runGit timeout each.
+          if (!throttle(req, 'git-read', 120)) { sendJson(res, 429, { error: 'rate limited, try again shortly' }); return; }
           const isDiff = url.pathname === '/api/git/diff';
           const rel = url.searchParams.get('p') || '';
           const args = isDiff
@@ -1105,11 +1205,21 @@ export function startServer(port = 3000, host = '127.0.0.1'): Promise<void> {
             const files: Array<{ p: string; x: string; y: string }> = [];
             for (const ln of lines) {
               if (ln.startsWith('## ')) {
-                const m = /^## ([^. ]+?)(?:\.\.\.[^ ]*)?(?: \[ahead (\d+)(?:, behind (\d+))?\]|\[behind (\d+)\])?/.exec(ln.slice(3));
-                if (m) {
-                  branch = m[1] === 'HEAD' ? '(detached)' : m[1];
-                  ahead = parseInt(m[2] || '0', 10) || 0;
-                  behind = parseInt(m[3] || m[4] || '0', 10) || 0;
+                // `## <branch>[...<upstream>][ [ahead N, behind M]]`. The old
+                // anchored `^## ` regex was run against ln.slice(3) — the very
+                // prefix it required had already been stripped — so it never
+                // matched and branch/ahead/behind were always empty/0. Branch
+                // names may contain dots, so split on the `...` upstream marker
+                // instead of pattern-matching the name. Git never puts spaces
+                // in refnames, so 'HEAD ' reliably identifies a detached HEAD.
+                const rest = ln.slice(3);
+                const up = rest.indexOf('...');
+                const raw = up >= 0 ? rest.slice(0, up) : rest.split(' [')[0];
+                branch = raw === 'HEAD' || raw.startsWith('HEAD ') ? '(detached)' : raw;
+                const info = /\[ahead (\d+)(?:, behind (\d+))?\]|\[behind (\d+)\]/.exec(rest);
+                if (info) {
+                  ahead = parseInt(info[1] || '0', 10) || 0;
+                  behind = parseInt(info[2] || info[3] || '0', 10) || 0;
                 }
                 continue;
               }
@@ -1193,6 +1303,10 @@ export function startServer(port = 3000, host = '127.0.0.1'): Promise<void> {
           if (!body) { sendJson(res, 400, { error: 'invalid json' }); return; }
           const dc = typeof body.device_code === 'string' ? body.device_code : '';
           if (!dc) { sendJson(res, 400, { error: 'device_code required' }); return; }
+          // Real GitHub device codes are ~40 chars, but readBody accepts bodies
+          // up to 5MB — and dc becomes a devicePolls map key below, so 200
+          // oversized codes would pin ~1GB in the map until the clear().
+          if (dc.length > 256) { sendJson(res, 400, { error: 'bad device_code' }); return; }
           const now = Date.now();
           const last = devicePolls.get(dc) || 0;
           if (now - last < 4000) {
@@ -1531,6 +1645,13 @@ export function startServer(port = 3000, host = '127.0.0.1'): Promise<void> {
         console.error(`Port ${port} in use. Try: node dist/server.js --port=3001 (or PORT=3001 npm run serve)`);
         process.exit(1);
       }
+      if (e.code === 'EACCES') {
+        // Binding a privileged port (<1024, non-root) used to fall through to
+        // rejectPromise → .catch(console.error): raw stack, exit code 0 —
+        // scripts/CI saw a successful start. Mirror the EADDRINUSE branch.
+        console.error(`Permission denied binding port ${port} (ports <1024 need elevated privileges). Try --port=3001.`);
+        process.exit(1);
+      }
       rejectPromise(e);
     });
     let shuttingDown = false;
@@ -1568,8 +1689,19 @@ export function startServer(port = 3000, host = '127.0.0.1'): Promise<void> {
 if (require.main === module) {
   const portArg = process.argv.find(a => a.startsWith('--port='));
   const hostArg = process.argv.find(a => a.startsWith('--host='));
-  const envPort = parseInt(process.env.PORT || '', 10);
-  const port = portArg ? parseInt(portArg.split('=')[1], 10) : (Number.isFinite(envPort) ? envPort : 3000);
-  const host = hostArg ? hostArg.split('=')[1] : (process.env.HOST || '127.0.0.1');
-  startServer(Number.isFinite(port) ? port : 3000, host).catch(console.error);
+  const rawPort = portArg ? portArg.split('=')[1] : (process.env.PORT || '');
+  // Mirror the identical guard in src/index.ts (--serve path): unvalidated
+  // parseInt let `--port=99999` reach server.listen and die with a raw
+  // ERR_SOCKET_BAD_PORT stack through the .catch() below, while `--port=abc`
+  // silently bound 3000 instead of reporting the typo. Must be 0-65535.
+  const port = rawPort === '' && !portArg ? 3000 : parseInt(rawPort, 10);
+  if (!Number.isInteger(port) || port < 0 || port > 65535) {
+    console.error(`Invalid port: ${rawPort} (expected 0-65535)`);
+    process.exit(1);
+  }
+  // `--host=` (empty value) must not bind every interface: listen(port, '')
+  // resolves to '::' — all interfaces — silently skipping the 0.0.0.0 warning
+  // below. Fall back through HOST to the loopback default instead.
+  const host = (hostArg ? hostArg.split('=')[1] : process.env.HOST) || '127.0.0.1';
+  startServer(port, host).catch(console.error);
 }
