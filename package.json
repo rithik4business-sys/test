@@ -38,6 +38,14 @@
     "code"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/krithikaliyanage04/TypeWriter.git"
+  },
+  "homepage": "https://github.com/krithikaliyanage04/TypeWriter#readme",
+  "bugs": {
+    "url": "https://github.com/krithikaliyanage04/TypeWriter/issues"
+  },
   "dependencies": {
     "node-pty": "^1.1.0",
     "ws": "^8.21.3",

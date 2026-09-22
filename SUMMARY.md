@@ -76,6 +76,15 @@ typewriter/
   completion latency, and ring-buffer throughput on your machine. Numbers go into
   docs only when they come from that run.
 
+Reference run (2026-09-22, linux/x64, Node v24.20.0 — reproduce with `npm run bench`):
+
+| Metric | Result |
+|---|---|
+| CLI startup (`--version`, median of 10) | 91.6 ms |
+| Highlight throughput (200-line JS buffer) | 8,646 KB/s (1.12 ms median) |
+| Completion suggestion latency | 2.5 µs |
+| RingBuffer push throughput | 71.6 M ops/sec |
+
 ### Security
 - **Local token storage** only
 - **OAuth 2.0** device flow
