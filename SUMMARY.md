@@ -2,34 +2,38 @@
 
 ## Overview
 
-TypeWriter is a lightweight, dependency-free terminal code editor built with TypeScript. It provides a VS Code-like editing experience directly in your terminal with automatic GitHub synchronization.
+TypeWriter is a lightweight terminal **and** web code editor built with TypeScript — one engine, two surfaces (TUI + browser IDE). Four runtime dependencies are used only where stdlib can't reach (`node-pty` for kernel PTYs, `ws` for WebSocket framing, `xterm` + `xterm-addon-fit` for terminal emulation in the browser); everything else is Node stdlib.
 
 ## Project Structure
 
 ```
 typewriter/
 ├── src/
-│   ├── index.ts          # Main entry point
-│   ├── editor.ts         # Core editor logic
-│   ├── highlight.ts      # Syntax highlighting
-│   ├── github.ts         # GitHub integration
-│   └── utils.ts          # Utility functions
-├── dist/                 # Compiled JavaScript
+│   ├── index.ts          # CLI entry (--help --serve --login --push --theme …)
+│   ├── editor.ts         # TUI editor core (vim grammar, buffers, splits, undo)
+│   ├── server.ts         # HTTP API + WebSocket bridge (PTY, LSP, auth)
+│   ├── github.ts         # GitHub API: device flow, repos, push, scope guards
+│   ├── collect.ts        # Project file collection for push (ignore rules)
+│   ├── complete.ts       # Line/ghost completion (recent, snippet, ngram, bracket)
+│   ├── highlight.ts      # Token-based syntax highlighting (20+ languages)
+│   ├── structures.ts     # RingBuffer / LinkedStack / CappedBuffer (O(1), capped)
+│   ├── themes.ts         # Theme definitions (34 themes)
+│   ├── utils.ts          # Config/token/session, atomic writes, safePath
+│   └── winsh.ts          # Windows-safe shell quoting, runners, taskkill
+├── public/index.html     # Web IDE (single-file frontend)
+├── test/                 # JS suite (node:test) incl. live-API + PTY-driven TUI
+├── test-ts/              # TS suite
+├── scripts/bench.js      # Benchmarks (npm run bench)
+├── dist/                 # Compiled JavaScript (gitignored)
 ├── docs/
-│   └── USAGE.md          # Usage documentation
+│   ├── USAGE.md          # Usage documentation
+│   └── GITHUB-LOGIN-PLAN.md
+├── assets/               # Icons
 ├── package.json          # Project configuration
 ├── tsconfig.json         # TypeScript configuration
-├── README.md             # Main documentation
-├── CHANGELOG.md          # Version history
-├── CONTRIBUTING.md       # Contribution guidelines
-├── LICENSE               # MIT License
+├── README.md · CHANGELOG.md · CONTRIBUTING.md · LICENSE
 ├── typewriter.ps1        # PowerShell wrapper
-├── typewriter.bat        # Windows batch wrapper
-├── example.ts            # Example TypeScript file
-├── example.js            # Example JavaScript file
-├── example.py            # Example Python file
-├── example.html          # Example HTML file
-└── example.css           # Example CSS file
+└── typewriter.bat        # Windows batch wrapper
 ```
 
 ## Features
@@ -67,10 +71,10 @@ typewriter/
 - **Event-driven** editor core
 
 ### Performance
-- **Lightweight**: ~50KB total code size
-- **Fast startup**: <100ms initialization
-- **Low memory**: ~10MB runtime usage
-- **Responsive**: Real-time syntax highlighting
+- **Lightweight**: no Electron — the TUI runs on plain Node, the web IDE reuses your browser
+- **Measured, not guessed**: run `npm run bench` for startup, highlighting throughput,
+  completion latency, and ring-buffer throughput on your machine. Numbers go into
+  docs only when they come from that run.
 
 ### Security
 - **Local token storage** only
@@ -117,8 +121,8 @@ typewriter --help
 ## Development
 
 ### Prerequisites
-- Node.js v14 or higher
-- npm or yarn
+- Node.js v18 or higher (uses `fetch` and the built-in test runner)
+- npm
 
 ### Commands
 ```bash
@@ -138,11 +142,9 @@ npm start        # Run compiled version
 ## Testing
 
 ```bash
-# Build and test
-npm run build
-node dist/index.js --help
-node dist/index.js --version
-node dist/index.js --status
+npm test        # build + JS suite (97 tests, node:test)
+npm run test:ts # TS suite (36 tests) — 133 total
+npm run bench   # startup / highlight / completion benchmarks
 ```
 
 ## Documentation
@@ -162,18 +164,19 @@ MIT License - see LICENSE file for details.
 - **Documentation**: Comprehensive usage guides
 - **Community**: Welcome contributions and feedback
 
-## Future Plans
+## Roadmap
 
-- File explorer sidebar
-- Multiple file tabs
-- Git integration
-- Extensions/plugins system
-- Custom themes
-- Auto-complete
-- Code folding
-- Split views
-- Remote file editing
-- Container support
+### Shipped (previously listed here as plans)
+- File explorer sidebar · multiple file tabs · split views · themes (34) ·
+  auto-complete (buffer words + LSP) · git status/diff in the push review ·
+  true PTY terminals · LSP hover/definition/completion · AI agent tabs
+
+### Planned
+- In-editor git commit/branch/log UI (server endpoints exist, UI pending)
+- Project-wide search UI (server endpoint exists, UI pending)
+- LSP diagnostics (squiggles + Problems panel), rename, format
+- Code folding · multi-cursor · auto-pairing · vim `f/F/t/T`, `*`/`#`, `%`, ranges, `:g`
+- Extensions/plugins system · packaged remote/tunnel editing · container support
 
 ---
 

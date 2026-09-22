@@ -17,7 +17,8 @@ A GitHub-connected code editor in TypeScript — a terminal TUI **and** a web ID
 npm install && npm run build
 npm start            # terminal editor
 npm run serve        # web IDE on :3000
-npm test             # build + 93 tests (node:test, no extra deps)
+npm test             # build + JS suite (97 tests, node:test, no extra deps)
+npm run test:ts      # TS suite (36 tests) — 133 total
 ```
 
 ## Web IDE keys (no mouse needed)

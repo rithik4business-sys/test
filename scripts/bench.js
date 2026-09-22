@@ -85,7 +85,6 @@ function benchComplete() {
   const t0 = process.hrtime.bigint();
   for (let i = 0; i < N; i++) suggestCompletion(input);
   const us = Number(process.hrtime.bigint() - t0) / 1000 / N;
-  console.log(`complete.avg_us ${us.toFixed(1)}`);
   return us;
 }
 
@@ -97,7 +96,6 @@ function benchRing() {
   const t0 = process.hrtime.bigint();
   for (let i = 0; i < N; i++) rb.push(i);
   const ops = N / (Number(process.hrtime.bigint() - t0) / 1e9);
-  console.log(`ring.ops_per_sec ${Math.round(ops).toLocaleString('en-US')}`);
   return ops;
 }
 

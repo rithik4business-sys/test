@@ -334,8 +334,6 @@ Click, `:bn` / `:bp`, `Ctrl+PgUp` / `Ctrl+PgDn`, `:bd` (dirty tabs need `:bd!`).
 - Ensure you're in the correct directory
 - Use `:w filename` to save as a new file
 
-## Support
-
 ## GitHub login UX (web: Settings → Account)
 
 Logged out, Account shows a single login card — repository UI appears only
