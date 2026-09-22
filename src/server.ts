@@ -229,7 +229,12 @@ const MAX_LSP = 4;
 let activeLsp = 0;
 function lspAccept(ws: any, url: URL): void {
   const lang = (url.searchParams.get('lang') || '').toLowerCase();
-  const spec = LSP_SERVERS[lang];
+  // Own-property guard: `lang` is attacker-controlled query input, and
+  // `LSP_SERVERS['constructor']` (etc.) is truthy on a plain object — the old
+  // lookup skipped the `unsupported language` rejection below and fell into
+  // spawn(undefined, …), answering a misleading `no-server` (plus an
+  // undefined install hint) instead of the real400-style error.
+  const spec = Object.prototype.hasOwnProperty.call(LSP_SERVERS, lang) ? LSP_SERVERS[lang] : undefined;
   const send = (o: any) => { try { ws.send(JSON.stringify(o)); } catch {} };
   if (!spec) { send({ t: 'error', error: 'unsupported language: ' + lang }); try { ws.close(); } catch {} return; }
   if (activeLsp >= MAX_LSP) { try { ws.close(1013, 'busy'); } catch {} return; }
@@ -700,7 +705,13 @@ export function startServer(port = 3000, host = '127.0.0.1'): Promise<void> {
             'codex.svg': 'image/svg+xml',
             'claude.svg': 'image/svg+xml',
           };
-          const type = ICONS[name];
+          // Own-property guard: a project file named `assets/icons/constructor`
+          // (bases include ROOT/assets/icons — the opened project) makes
+          // `ICONS['constructor']` return the Object constructor, and that
+          // Function reaching writeHead throws ERR_HTTP_INVALID_HEADER_VALUE
+          // → the route's catch answers 404 for a file that exists. Same bug
+          // class as MIME_MAP below (see its comment).
+          const type = Object.prototype.hasOwnProperty.call(ICONS, name) ? ICONS[name] : undefined;
           if (!type || name.includes('..') || name.includes('/')) {
             res.writeHead(404, { 'Content-Type': 'text/plain' });
             res.end('Not found');
@@ -1112,6 +1123,11 @@ export function startServer(port = 3000, host = '127.0.0.1'): Promise<void> {
         // ---- project search (respects hidden rules + size caps) ----
         if (url.pathname === '/api/search' && req.method === 'POST') {
           if (!needAuth(req, url, res)) return;
+          // Every other expensive route is throttled (exec:941, git-write:1215,
+          // agents-install:757); search alone did a synchronous walk of up to
+          // 2000 files per request with no limit — 1000 parallel POSTs stall
+          // the event loop for seconds each.
+          if (!throttle(req, 'search', 60)) { sendJson(res, 429, { error: 'rate limited, try again shortly' }); return; }
           const body = await parseJsonBody(req);
           if (!body) { sendJson(res, 400, { error: 'invalid json' }); return; }
           const q = typeof body.q === 'string' ? body.q : '';
@@ -1167,6 +1183,11 @@ export function startServer(port = 3000, host = '127.0.0.1'): Promise<void> {
         // ---- local git (status / diff / commit / pull / init) ----
         if ((url.pathname === '/api/git/status' || url.pathname === '/api/git/diff') && req.method === 'GET') {
           if (!needAuth(req, url, res)) return;
+          // Unlike exec (MAX_EXECS=4 at :946) and git-write (:1215), this route
+          // spawned one `git` child per request with no cap or throttle — a
+          // request flood pinned up to N concurrent git processes for the full
+          // 20s runGit timeout each.
+          if (!throttle(req, 'git-read', 120)) { sendJson(res, 429, { error: 'rate limited, try again shortly' }); return; }
           const isDiff = url.pathname === '/api/git/diff';
           const rel = url.searchParams.get('p') || '';
           const args = isDiff
@@ -1624,6 +1645,13 @@ export function startServer(port = 3000, host = '127.0.0.1'): Promise<void> {
         console.error(`Port ${port} in use. Try: node dist/server.js --port=3001 (or PORT=3001 npm run serve)`);
         process.exit(1);
       }
+      if (e.code === 'EACCES') {
+        // Binding a privileged port (<1024, non-root) used to fall through to
+        // rejectPromise → .catch(console.error): raw stack, exit code 0 —
+        // scripts/CI saw a successful start. Mirror the EADDRINUSE branch.
+        console.error(`Permission denied binding port ${port} (ports <1024 need elevated privileges). Try --port=3001.`);
+        process.exit(1);
+      }
       rejectPromise(e);
     });
     let shuttingDown = false;
@@ -1661,11 +1689,19 @@ export function startServer(port = 3000, host = '127.0.0.1'): Promise<void> {
 if (require.main === module) {
   const portArg = process.argv.find(a => a.startsWith('--port='));
   const hostArg = process.argv.find(a => a.startsWith('--host='));
-  const envPort = parseInt(process.env.PORT || '', 10);
-  const port = portArg ? parseInt(portArg.split('=')[1], 10) : (Number.isFinite(envPort) ? envPort : 3000);
+  const rawPort = portArg ? portArg.split('=')[1] : (process.env.PORT || '');
+  // Mirror the identical guard in src/index.ts (--serve path): unvalidated
+  // parseInt let `--port=99999` reach server.listen and die with a raw
+  // ERR_SOCKET_BAD_PORT stack through the .catch() below, while `--port=abc`
+  // silently bound 3000 instead of reporting the typo. Must be 0-65535.
+  const port = rawPort === '' && !portArg ? 3000 : parseInt(rawPort, 10);
+  if (!Number.isInteger(port) || port < 0 || port > 65535) {
+    console.error(`Invalid port: ${rawPort} (expected 0-65535)`);
+    process.exit(1);
+  }
   // `--host=` (empty value) must not bind every interface: listen(port, '')
   // resolves to '::' — all interfaces — silently skipping the 0.0.0.0 warning
   // below. Fall back through HOST to the loopback default instead.
   const host = (hostArg ? hostArg.split('=')[1] : process.env.HOST) || '127.0.0.1';
-  startServer(Number.isFinite(port) ? port : 3000, host).catch(console.error);
+  startServer(port, host).catch(console.error);
 }
